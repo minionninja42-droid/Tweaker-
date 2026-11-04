@@ -1,4 +1,4 @@
-name: Build APK
+name: HomeLauncher-apk
 on:
   push:
   workflow_dispatch:
