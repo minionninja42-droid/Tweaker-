@@ -1,0 +1,359 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Accept Android licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "GameLauncher"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=true
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.gamelauncher"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.gamelauncher"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+              <application
+                  android:label="Game Launcher"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/gamelauncher
+          cat > app/src/main/java/com/example/gamelauncher/MainActivity.kt <<'EOF_FILE'
+          package com.example.gamelauncher
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.content.pm.PackageManager
+          import android.graphics.drawable.Drawable
+          import android.os.Bundle
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.*
+          import rikka.shizuku.Shizuku
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+
+              private val cutouts = listOf("none", "corner", "double", "narrow", "wide", "tall", "hole")
+              private val base = "com.android.internal.display.cutout.emulation"
+              private lateinit var prefs: SharedPreferences
+              private lateinit var adapter: GameAdapter
+              private lateinit var status: TextView
+              private val games = mutableListOf<String>()
+
+              private val permListener = Shizuku.OnRequestPermissionResultListener { _, _ ->
+                  runOnUiThread { toast("Доступ: " + if (hasPerm()) "выдан" else "отказано") }
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+              private fun hasPerm() = try {
+                  Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+              } catch (e: Throwable) { false }
+
+              private fun sh(cmd: String): String {
+                  val m = Shizuku::class.java.getDeclaredMethod(
+                      "newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java
+                  )
+                  m.isAccessible = true
+                  val p = m.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+                  val out = p.inputStream.bufferedReader().readText() + p.errorStream.bufferedReader().readText()
+                  p.waitFor()
+                  return out.trim()
+              }
+
+              private fun labelOf(pkg: String): String = try {
+                  packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+              } catch (e: Exception) { pkg }
+
+              private fun iconOf(pkg: String): Drawable? = try {
+                  packageManager.getApplicationIcon(pkg)
+              } catch (e: Exception) { null }
+
+              private fun load() {
+                  games.clear()
+                  games.addAll(prefs.getStringSet("games", emptySet())!!
+                      .filter { packageManager.getLaunchIntentForPackage(it) != null }
+                      .sortedBy { labelOf(it).lowercase() })
+              }
+
+              private fun save() = prefs.edit().putStringSet("games", games.toSet()).apply()
+
+              private fun refresh() { load(); adapter.notifyDataSetChanged() }
+
+              private fun disableAllCutouts() = cutouts.drop(1).joinToString("; ") { "cmd overlay disable $base.$it" }
+
+              private fun resetScreen() {
+                  if (!hasPerm()) { toast("Нет доступа Shizuku"); return }
+                  thread {
+                      val r = try { sh("settings delete system min_refresh_rate; settings delete system peak_refresh_rate; wm size reset; wm density reset; " + disableAllCutouts()) } catch (e: Throwable) { "Ошибка: ${e.message}" }
+                      runOnUiThread { status.text = "Экран сброшен" }
+                  }
+              }
+
+              private fun launch(pkg: String) {
+                  val intent = packageManager.getLaunchIntentForPackage(pkg) ?: return
+                  val w = prefs.getInt("w_$pkg", 0)
+                  val c = prefs.getString("c_$pkg", "none") ?: "none"
+                  val boost = prefs.getBoolean("b_$pkg", false)
+                  val r = prefs.getInt("r_$pkg", 100)
+                  val hz = prefs.getInt("h_$pkg", 0)
+                  val cmds = mutableListOf<String>()
+                  if (hz > 0) cmds += "settings put system min_refresh_rate $hz; settings put system peak_refresh_rate $hz"
+                  if (r < 100 || w >= 200) {
+                      cmds += "S=\$(wm size | grep Physical | sed 's/.*: //'); W=\${S%x*}; H=\${S#*x}"
+                      if (r < 100) cmds += "wm size \$((W*$r/100))x\$((H*$r/100))"
+                      if (w >= 200) cmds += "wm density \$((160*W*$r/100/$w))"
+                  }
+                  if (c != "none") cmds += disableAllCutouts() + "; cmd overlay enable $base.$c"
+                  if (boost) {
+                      cmds += "cmd game mode performance $pkg"
+                      cmds += "am kill-all"
+                  }
+                  if (cmds.isEmpty() || !hasPerm()) {
+                      if (cmds.isNotEmpty()) toast("Нет доступа Shizuku, запускаю без настроек")
+                      startActivity(intent)
+                      return
+                  }
+                  thread {
+                      try { sh(cmds.joinToString("; ")) } catch (e: Throwable) { }
+                      Thread.sleep(600)
+                      runOnUiThread { startActivity(intent) }
+                  }
+              }
+
+              private fun addDialog() {
+                  val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val apps = packageManager.queryIntentActivities(q, 0)
+                      .map { it.activityInfo.packageName }.distinct()
+                      .filter { it != packageName && it !in games }
+                      .sortedBy { labelOf(it).lowercase() }
+                  val names = apps.map { labelOf(it) }.toTypedArray()
+                  val checked = BooleanArray(apps.size)
+                  AlertDialog.Builder(this).setTitle("Выберите игры")
+                      .setMultiChoiceItems(names, checked) { _, i, b -> checked[i] = b }
+                      .setPositiveButton("Добавить") { _, _ ->
+                          apps.forEachIndexed { i, p -> if (checked[i]) games.add(p) }
+                          save(); refresh()
+                      }
+                      .setNegativeButton("Отмена", null).show()
+              }
+
+              private fun editDialog(pkg: String) {
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(10), dp(20), 0)
+                  }
+                  val w = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      hint = "Мин. ширина, dp (пусто = не менять)"
+                      val cur = prefs.getInt("w_$pkg", 0)
+                      if (cur > 0) setText(cur.toString())
+                  }
+                  val sp = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, cutouts)
+                      setSelection(cutouts.indexOf(prefs.getString("c_$pkg", "none")).coerceAtLeast(0))
+                  }
+                  val boost = CheckBox(this).apply {
+                      text = "FPS-буст (режим производительности + очистка памяти)"
+                      isChecked = prefs.getBoolean("b_$pkg", false)
+                  }
+                  val resOpts = listOf(100, 90, 80, 70, 60)
+                  val rs = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                          resOpts.map { "Разрешение экрана $it%" })
+                      setSelection(resOpts.indexOf(prefs.getInt("r_$pkg", 100)).coerceAtLeast(0))
+                  }
+                  val hzOpts = listOf(0, 60, 90, 120, 144)
+                  val hs = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                          hzOpts.map { if (it == 0) "Частота экрана: авто" else "Частота экрана: $it Гц" })
+                      setSelection(hzOpts.indexOf(prefs.getInt("h_$pkg", 0)).coerceAtLeast(0))
+                  }
+                  box.addView(w); box.addView(sp); box.addView(boost); box.addView(rs); box.addView(hs)
+                  AlertDialog.Builder(this).setTitle(labelOf(pkg)).setView(ScrollView(this).apply { addView(box) })
+                      .setPositiveButton("Сохранить") { _, _ ->
+                          prefs.edit()
+                              .putInt("w_$pkg", w.text.toString().toIntOrNull() ?: 0)
+                              .putString("c_$pkg", cutouts[sp.selectedItemPosition])
+                              .putBoolean("b_$pkg", boost.isChecked)
+                              .putInt("r_$pkg", resOpts[rs.selectedItemPosition])
+                              .putInt("h_$pkg", hzOpts[hs.selectedItemPosition]).apply()
+                          adapter.notifyDataSetChanged()
+                      }
+                      .setNeutralButton("Убрать из списка") { _, _ -> games.remove(pkg); save(); refresh() }
+                      .setNegativeButton("Отмена", null).show()
+              }
+
+              inner class GameAdapter : BaseAdapter() {
+                  override fun getCount() = games.size
+                  override fun getItem(i: Int) = games[i]
+                  override fun getItemId(i: Int) = i.toLong()
+                  override fun getView(i: Int, v: View?, p: ViewGroup?): View {
+                      val pkg = games[i]
+                      val w = prefs.getInt("w_$pkg", 0)
+                      val c = prefs.getString("c_$pkg", "none")
+                      val row = LinearLayout(this@MainActivity).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                          setPadding(dp(16), dp(10), dp(16), dp(10))
+                      }
+                      val icon = ImageView(this@MainActivity).apply {
+                          layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
+                          setImageDrawable(iconOf(pkg))
+                      }
+                      val col = LinearLayout(this@MainActivity).apply {
+                          orientation = LinearLayout.VERTICAL
+                          setPadding(dp(14), 0, 0, 0)
+                      }
+                      col.addView(TextView(this@MainActivity).apply { text = labelOf(pkg); textSize = 17f })
+                      col.addView(TextView(this@MainActivity).apply {
+                          text = "Ширина: " + (if (w >= 200) "$w dp" else "не менять") +
+                              "  •  Вырез: " + (if (c == "none") "не менять" else c) +
+                              (if (prefs.getInt("h_$pkg", 0) > 0) "  •  ${prefs.getInt("h_$pkg", 0)} Гц" else "") +
+                              (if (prefs.getBoolean("b_$pkg", false)) "\nБуст: вкл" else "") +
+                              (if (prefs.getInt("r_$pkg", 100) < 100) "  •  Разрешение: ${prefs.getInt("r_$pkg", 100)}%" else "")
+                          textSize = 13f
+                      })
+                      row.addView(icon); row.addView(col)
+                      return row
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  prefs = getSharedPreferences("games", MODE_PRIVATE)
+                  Shizuku.addRequestPermissionResultListener(permListener)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(8), dp(36), dp(8), dp(8))
+                  }
+                  root.addView(TextView(this).apply {
+                      text = "Мои игры"; textSize = 24f; setPadding(dp(8), 0, 0, dp(8))
+                  })
+
+                  fun btn(t: String, f: () -> Unit) = Button(this).apply {
+                      text = t; textSize = 12f
+                      layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                      setOnClickListener { f() }
+                  }
+                  val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  bar.addView(btn("+ Игра") { addDialog() })
+                  bar.addView(btn("Доступ") {
+                      try {
+                          if (!Shizuku.pingBinder()) toast("Shizuku не запущен") else Shizuku.requestPermission(0)
+                      } catch (e: Throwable) { toast("Shizuku не установлен") }
+                  })
+                  bar.addView(btn("Сброс экрана") { resetScreen() })
+                  root.addView(bar)
+
+                  status = TextView(this).apply { setPadding(dp(8), dp(4), dp(8), dp(4)); textSize = 12f }
+                  root.addView(status)
+
+                  val lv = ListView(this)
+                  adapter = GameAdapter()
+                  lv.adapter = adapter
+                  lv.setOnItemClickListener { _, _, i, _ -> launch(games[i]) }
+                  lv.setOnItemLongClickListener { _, _, i, _ -> editDialog(games[i]); true }
+                  root.addView(lv)
+
+                  val hint = TextView(this).apply {
+                      text = "Нажмите на игру — запуск с её настройками.\nДолгое нажатие — изменить настройки."
+                      textSize = 12f; setPadding(dp(8), dp(8), dp(8), 0)
+                  }
+                  root.addView(hint)
+
+                  setContentView(root)
+                  refresh()
+              }
+
+              override fun onDestroy() {
+                  Shizuku.removeRequestPermissionResultListener(permListener)
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+      - name: Build
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GameLauncher-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
