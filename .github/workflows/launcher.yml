@@ -1,4 +1,4 @@
-name: Build APK
+name: Launcher APK
 on:
   push:
   workflow_dispatch:
