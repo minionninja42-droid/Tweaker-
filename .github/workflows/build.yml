@@ -155,6 +155,9 @@ jobs:
           import android.graphics.Rect
           import android.graphics.RectF
           import android.graphics.Shader
+          import android.graphics.ColorMatrix
+          import android.graphics.ColorMatrixColorFilter
+          import android.graphics.drawable.AdaptiveIconDrawable
           import android.graphics.drawable.ColorDrawable
           import android.graphics.drawable.Drawable
           import android.graphics.drawable.GradientDrawable
@@ -272,27 +275,34 @@ jobs:
               override fun getOpacity() = PixelFormat.TRANSLUCENT
           }
 
-          /** Рамка с точками поверх виджета: тяните за точки справа, снизу или в углу. */
+          /** Рамка поверх элемента: тяните за середину — двигать, за белые точки — менять размер (только виджеты). */
           class ResizeOverlay(
               ctx: Context,
-              private val onDrag: (dx: Float, dy: Float, rw: Boolean, rh: Boolean, done: Boolean) -> Unit
+              private val resizable: Boolean,
+              private val onDrag: (dx: Float, dy: Float, rw: Boolean, rh: Boolean, mv: Boolean, done: Boolean) -> Unit
           ) : View(ctx) {
               private val p = Paint(Paint.ANTI_ALIAS_FLAG)
               private var sx = 0f
               private var sy = 0f
               private var rw = false
               private var rh = false
+              private var mv = false
 
               override fun onDraw(c: Canvas) {
                   val d = resources.displayMetrics.density
+                  p.style = Paint.Style.FILL
+                  p.color = Color.argb(40, 255, 255, 255)
+                  c.drawRoundRect(RectF(2 * d, 2 * d, width - 2 * d, height - 2 * d), 12 * d, 12 * d, p)
                   p.style = Paint.Style.STROKE
                   p.strokeWidth = 3 * d
                   p.color = Color.WHITE
                   c.drawRoundRect(RectF(2 * d, 2 * d, width - 2 * d, height - 2 * d), 12 * d, 12 * d, p)
-                  p.style = Paint.Style.FILL
-                  c.drawCircle(width - 2 * d, height / 2f, 10 * d, p)
-                  c.drawCircle(width / 2f, height - 2 * d, 10 * d, p)
-                  c.drawCircle(width - 2 * d, height - 2 * d, 13 * d, p)
+                  if (resizable) {
+                      p.style = Paint.Style.FILL
+                      c.drawCircle(width - 2 * d, height / 2f, 10 * d, p)
+                      c.drawCircle(width / 2f, height - 2 * d, 10 * d, p)
+                      c.drawCircle(width - 2 * d, height - 2 * d, 13 * d, p)
+                  }
               }
 
               override fun onTouchEvent(e: MotionEvent): Boolean {
@@ -301,11 +311,12 @@ jobs:
                       MotionEvent.ACTION_DOWN -> {
                           parent.requestDisallowInterceptTouchEvent(true)
                           sx = e.rawX; sy = e.rawY
-                          rw = e.x > width - 44 * d
-                          rh = e.y > height - 44 * d
+                          rw = resizable && e.x > width - 44 * d
+                          rh = resizable && e.y > height - 44 * d
+                          mv = !rw && !rh
                       }
-                      MotionEvent.ACTION_MOVE -> onDrag(e.rawX - sx, e.rawY - sy, rw, rh, false)
-                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> onDrag(e.rawX - sx, e.rawY - sy, rw, rh, true)
+                      MotionEvent.ACTION_MOVE -> onDrag(e.rawX - sx, e.rawY - sy, rw, rh, mv, false)
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> onDrag(e.rawX - sx, e.rawY - sy, rw, rh, mv, true)
                   }
                   return true
               }
@@ -313,7 +324,7 @@ jobs:
 
           class MainActivity : Activity() {
 
-              data class App(val pkg: String, val label: String, val icon: Drawable)
+              data class App(val pkg: String, val label: String, val icon: Drawable, val mono: Drawable? = null)
               data class Item(val type: String, var page: Int, var x: Int, var y: Int, var w: Int, var h: Int, val ref: String)
 
               private val C = 4
@@ -326,6 +337,8 @@ jobs:
               private lateinit var pager: ViewPager
               private lateinit var dots: TextView
               private lateinit var dock: LinearLayout
+              private lateinit var clockHolder: FrameLayout
+              private lateinit var askPill: TextView
               private lateinit var drawer: LinearLayout
               private lateinit var grid: GridView
               private lateinit var search: EditText
@@ -397,7 +410,11 @@ jobs:
                       val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
                       val list = packageManager.queryIntentActivities(q, 0)
                           .filter { it.activityInfo.packageName != packageName }
-                          .map { App(it.activityInfo.packageName, it.loadLabel(packageManager).toString(), it.loadIcon(packageManager)) }
+                          .map {
+                              val ic = it.loadIcon(packageManager)
+                              val mono = if (Build.VERSION.SDK_INT >= 33 && ic is AdaptiveIconDrawable) ic.monochrome else null
+                              App(it.activityInfo.packageName, it.loadLabel(packageManager).toString(), ic, mono)
+                          }
                           .distinctBy { it.pkg }
                           .sortedBy { it.label.lowercase() }
                       runOnUiThread {
@@ -435,6 +452,27 @@ jobs:
                   dots.text = (0 until pageCount).joinToString("  ") { if (it == pager.currentItem) "●" else "○" }
               }
 
+              private fun iconImage(a: App, size: Int): ImageView {
+                  val iv = ImageView(this).apply { layoutParams = LinearLayout.LayoutParams(size, size) }
+                  if (prefs.getBoolean("realme", false)) {
+                      val pad = (size * 0.2f).toInt()
+                      iv.setPadding(pad, pad, pad, pad)
+                      iv.background = GradientDrawable(
+                          GradientDrawable.Orientation.TOP_BOTTOM,
+                          intArrayOf(Color.argb(238, 255, 255, 255), Color.argb(195, 232, 232, 238))
+                      ).apply { cornerRadius = size * 0.3f; setStroke(2, Color.argb(170, 255, 255, 255)) }
+                      val mono = a.mono
+                      if (mono != null) {
+                          iv.setImageDrawable(mono)
+                          iv.setColorFilter(Color.parseColor("#4A4A50"))
+                      } else {
+                          iv.setImageDrawable(a.icon)
+                          iv.colorFilter = ColorMatrixColorFilter(ColorMatrix().apply { setSaturation(0f) })
+                      }
+                  } else iv.setImageDrawable(a.icon)
+                  return iv
+              }
+
               private fun iconView(a: App, onClick: () -> Unit, onLong: () -> Unit): View {
                   val size = dp(prefs.getInt("icon", 56))
                   val col = LinearLayout(this).apply {
@@ -443,10 +481,7 @@ jobs:
                       setOnClickListener { onClick() }
                       setOnLongClickListener { onLong(); true }
                   }
-                  col.addView(ImageView(this).apply {
-                      layoutParams = LinearLayout.LayoutParams(size, size)
-                      setImageDrawable(a.icon)
-                  })
+                  col.addView(iconImage(a, size))
                   if (prefs.getBoolean("labels", true)) {
                       col.addView(TextView(this).apply {
                           text = a.label; setTextColor(Color.WHITE); textSize = 12f
@@ -491,31 +526,47 @@ jobs:
                           if (m != null) moveTo(m, pos, cl.cellX(cl.lastX), cl.cellY(cl.lastY))
                       }
                   }
-                  val views = HashMap<String, View>()
+                  val views = java.util.IdentityHashMap<Item, View>()
                   for (item in items.filter { it.page == pos }) {
                       makeView(item)?.let {
-                          if (item.type == "widget") views[item.ref] = it
+                          views[item] = it
                           cl.addView(it, CellLayout.LP(item.x, item.y, item.w, item.h))
                       }
                   }
                   val rz = resizing
                   if (rz != null && rz.page == pos) {
-                      val wv = views[rz.ref]
+                      val wv = views[rz]
                       val ovLp = CellLayout.LP(rz.x, rz.y, rz.w, rz.h)
                       var bw = rz.w
                       var bh = rz.h
-                      val ov = ResizeOverlay(this) { dx, dy, rw, rh, done ->
+                      var bx = rz.x
+                      var by = rz.y
+                      val ov = ResizeOverlay(this, rz.type == "widget") { dx, dy, rw, rh, mv, done ->
                           val cw = maxOf(1, cl.width / C)
                           val ch = maxOf(1, cl.height / R)
-                          val nw = if (rw) (bw + Math.round(dx / cw)).coerceIn(1, C - rz.x) else bw
-                          val nh = if (rh) (bh + Math.round(dy / ch)).coerceIn(1, R - rz.y) else bh
-                          if ((nw != rz.w || nh != rz.h) && isFree(rz.page, rz.x, rz.y, nw, nh, rz)) {
-                              rz.w = nw; rz.h = nh
-                              ovLp.w = nw; ovLp.h = nh
-                              (wv?.layoutParams as? CellLayout.LP)?.let { lp -> lp.w = nw; lp.h = nh }
-                              cl.requestLayout()
+                          if (mv) {
+                              val nx = (bx + Math.round(dx / cw)).coerceIn(0, C - rz.w)
+                              val ny = (by + Math.round(dy / ch)).coerceIn(0, R - rz.h)
+                              if ((nx != rz.x || ny != rz.y) && isFree(rz.page, nx, ny, rz.w, rz.h, rz)) {
+                                  rz.x = nx; rz.y = ny
+                                  ovLp.x = nx; ovLp.y = ny
+                                  (wv?.layoutParams as? CellLayout.LP)?.let { lp -> lp.x = nx; lp.y = ny }
+                                  cl.requestLayout()
+                              }
+                          } else {
+                              val nw = if (rw) (bw + Math.round(dx / cw)).coerceIn(1, C - rz.x) else bw
+                              val nh = if (rh) (bh + Math.round(dy / ch)).coerceIn(1, R - rz.y) else bh
+                              if ((nw != rz.w || nh != rz.h) && isFree(rz.page, rz.x, rz.y, nw, nh, rz)) {
+                                  rz.w = nw; rz.h = nh
+                                  ovLp.w = nw; ovLp.h = nh
+                                  (wv?.layoutParams as? CellLayout.LP)?.let { lp -> lp.w = nw; lp.h = nh }
+                                  cl.requestLayout()
+                              }
                           }
-                          if (done) { bw = rz.w; bh = rz.h; saveItems(); refreshHome() }
+                          if (done) {
+                              bw = rz.w; bh = rz.h; bx = rz.x; by = rz.y
+                              saveItems(); refreshHome()
+                          }
                       }
                       cl.addView(ov, ovLp)
                   }
@@ -547,14 +598,22 @@ jobs:
               }
 
               private fun itemMenu(item: Item) {
-                  val opts = if (item.type == "widget") arrayOf("Переместить", "Изменить размер", "Удалить")
-                             else arrayOf("Переместить", "Убрать с рабочего стола")
+                  val widget = item.type == "widget"
+                  val opts = arrayOf(
+                      if (widget) "Двигать пальцем / менять размер" else "Двигать пальцем",
+                      "На другую страницу",
+                      if (widget) "Удалить" else "Убрать с рабочего стола"
+                  )
                   AlertDialog.Builder(this).setItems(opts) { _, i ->
-                      when {
-                          i == 0 -> { moving = item; toast("Нажмите на свободное место (можно на другой странице)") }
-                          item.type == "widget" && i == 1 -> { resizing = item; refreshHome(); toast("Тяните белые точки. Нажмите вне виджета, чтобы закончить") }
+                      when (i) {
+                          0 -> {
+                              resizing = item; refreshHome()
+                              toast(if (widget) "Тяните за середину, чтобы двигать, за точки — менять размер. Нажмите вне рамки, чтобы закончить"
+                                    else "Тяните иконку пальцем. Нажмите вне рамки, чтобы закончить")
+                          }
+                          1 -> { moving = item; toast("Нажмите на свободное место (можно на другой странице)") }
                           else -> {
-                              if (item.type == "widget") host.deleteAppWidgetId(item.ref.toInt())
+                              if (widget) host.deleteAppWidgetId(item.ref.toInt())
                               items.remove(item); saveItems(); refreshHome()
                           }
                       }
@@ -668,12 +727,15 @@ jobs:
                   val size = dp(prefs.getInt("icon", 56))
                   for (p in dockList()) {
                       val a = all.firstOrNull { it.pkg == p } ?: continue
-                      dock.addView(ImageView(this).apply {
+                      val cell = FrameLayout(this).apply {
                           layoutParams = LinearLayout.LayoutParams(0, size, 1f)
-                          setImageDrawable(a.icon)
                           setOnClickListener { launch(a.pkg) }
                           setOnLongClickListener { appMenu(a); true }
+                      }
+                      cell.addView(iconImage(a, size).apply {
+                          layoutParams = FrameLayout.LayoutParams(size, size, Gravity.CENTER)
                       })
+                      dock.addView(cell)
                   }
                   dock.addView(TextView(this).apply {
                       text = "▦"; textSize = 28f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
@@ -722,7 +784,7 @@ jobs:
                   } catch (e: Throwable) { null }
               }
 
-              private fun saveGlass(src: Bitmap) {
+              private fun saveGlass(src: Bitmap, name: String = "glass.jpg") {
                   try {
                       var cur = src
                       val w = src.width
@@ -733,7 +795,7 @@ jobs:
                       while (cur.width < w) {
                           cur = Bitmap.createScaledBitmap(cur, minOf(w, cur.width * 2), minOf(h, cur.height * 2), true)
                       }
-                      glassFile().outputStream().use { cur.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+                      File(filesDir, name).outputStream().use { cur.compress(Bitmap.CompressFormat.JPEG, 90, it) }
                   } catch (e: Throwable) { }
               }
 
@@ -761,6 +823,15 @@ jobs:
                   adapter.notifyDataSetChanged()
                   buildDock()
                   applyGlass()
+                  val rm = prefs.getBoolean("realme", false)
+                  clockHolder.removeAllViews()
+                  if (rm) {
+                      clockHolder.addView(
+                          GlassClockView(this, false, false, prefs.getBoolean("lk_24", true), prefs.getBoolean("hclock_light", false)),
+                          FrameLayout.LayoutParams(dp(190), dp(104), Gravity.CENTER_HORIZONTAL)
+                      )
+                  }
+                  askPill.visibility = if (rm) View.VISIBLE else View.GONE
                   refreshHome()
               }
 
@@ -776,6 +847,14 @@ jobs:
                   val labels = CheckBox(this).apply { text = "Показывать подписи"; isChecked = prefs.getBoolean("labels", true) }
                   val dim = SeekBar(this).apply { max = 180; progress = prefs.getInt("dim", 0) }
                   val glassBar = SeekBar(this).apply { max = 120; progress = prefs.getInt("glass", 45) }
+                  val realmeCb = CheckBox(this).apply {
+                      text = "Стиль «стекло» как в Realme UI (часы, иконки)"
+                      isChecked = prefs.getBoolean("realme", false)
+                  }
+                  val lightCb = CheckBox(this).apply {
+                      text = "Светлые часы на рабочем столе"
+                      isChecked = prefs.getBoolean("hclock_light", false)
+                  }
                   val wblur = CheckBox(this).apply { text = "Размытие фона при открытии списка (Android 12+)"; isChecked = prefs.getBoolean("wblur", true) }
                   val wp = Button(this).apply { text = "Обои"; setOnClickListener { wallpaperDialog() } }
                   val unhide = Button(this).apply {
@@ -785,6 +864,7 @@ jobs:
                   box.addView(label("Колонок в списке приложений")); box.addView(cols)
                   box.addView(label("Размер иконок")); box.addView(icon)
                   box.addView(labels)
+                  box.addView(realmeCb); box.addView(lightCb)
                   box.addView(label("Затемнение фона")); box.addView(dim)
                   box.addView(label("Яркость стекла (панели, док, поиск)")); box.addView(glassBar)
                   box.addView(wblur)
@@ -806,7 +886,9 @@ jobs:
                       }
                   }
                   box.addView(wp); box.addView(unhide)
-                  box.addView(label("Экран блокировки")); box.addView(lockCb); box.addView(lockTest); box.addView(battery)
+                  box.addView(label("Экран блокировки")); box.addView(lockCb)
+                  box.addView(Button(this).apply { text = "Настроить стиль экрана блокировки"; setOnClickListener { lockStyleDialog() } })
+                  box.addView(lockTest); box.addView(battery)
                   AlertDialog.Builder(this).setTitle("Настройки").setView(ScrollView(this).apply { addView(box) })
                       .setPositiveButton("Готово") { _, _ ->
                           prefs.edit()
@@ -815,7 +897,9 @@ jobs:
                               .putBoolean("labels", labels.isChecked)
                               .putInt("dim", dim.progress)
                               .putInt("glass", glassBar.progress)
-                              .putBoolean("wblur", wblur.isChecked).apply()
+                              .putBoolean("wblur", wblur.isChecked)
+                              .putBoolean("realme", realmeCb.isChecked)
+                              .putBoolean("hclock_light", lightCb.isChecked).apply()
                           applySettings()
                           val on = lockCb.isChecked
                           prefs.edit().putBoolean("lock", on).apply()
@@ -828,6 +912,57 @@ jobs:
                                   startLock(true)
                               }
                           } else startLock(false)
+                      }
+                      .setNegativeButton("Отмена", null).show()
+              }
+
+              private fun lockStyleDialog() {
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(10), dp(20), 0) }
+                  fun label(t: String) = TextView(this@MainActivity).apply { text = t; setPadding(0, dp(14), 0, dp(2)) }
+                  val styles = listOf("Стеклянная карточка", "Крупные часы без панели", "Компактная плашка", "Realme: цифры в ряд", "Realme: цифры столбиком")
+                  val st = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, styles)
+                      setSelection(prefs.getInt("lk_style", 0).coerceIn(0, 4))
+                  }
+                  val alpha = SeekBar(this).apply { max = 140; progress = prefs.getInt("lk_alpha", 50) }
+                  val colors = listOf(
+                      "Белый" to Color.WHITE, "Чёрный" to Color.parseColor("#111111"), "Тёплый" to Color.parseColor("#FFD9A8"),
+                      "Голубой" to Color.parseColor("#A8E6FF"), "Розовый" to Color.parseColor("#FFC1E3")
+                  )
+                  val cs = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, colors.map { it.first })
+                      setSelection(colors.indexOfFirst { it.second == prefs.getInt("lk_color", Color.WHITE) }.coerceAtLeast(0))
+                  }
+                  val size = SeekBar(this).apply { max = 80; progress = prefs.getInt("lk_size", 80) - 40 }
+                  val dim = SeekBar(this).apply { max = 160; progress = prefs.getInt("lk_dim", 60) }
+                  val cbDate = CheckBox(this).apply { text = "Показывать дату"; isChecked = prefs.getBoolean("lk_date", true) }
+                  val cb24 = CheckBox(this).apply { text = "24-часовой формат"; isChecked = prefs.getBoolean("lk_24", true) }
+                  val cbBatt = CheckBox(this).apply { text = "Показывать заряд батареи"; isChecked = prefs.getBoolean("lk_batt", true) }
+                  val cbHint = CheckBox(this).apply { text = "Подсказка «Проведите вверх»"; isChecked = prefs.getBoolean("lk_hint", true) }
+                  box.addView(label("Стиль часов")); box.addView(st)
+                  box.addView(label("Яркость стекла")); box.addView(alpha)
+                  box.addView(label("Цвет текста")); box.addView(cs)
+                  box.addView(label("Размер часов")); box.addView(size)
+                  box.addView(label("Затемнение обоев")); box.addView(dim)
+                  box.addView(cbDate); box.addView(cb24); box.addView(cbBatt); box.addView(cbHint)
+                  box.addView(label(if (File(filesDir, "lockglass.jpg").exists()) "Размытие под стеклом: активно"
+                      else "Для размытия задайте обои: Обои → Экран блокировки"))
+                  val save = {
+                      prefs.edit()
+                          .putInt("lk_style", st.selectedItemPosition)
+                          .putInt("lk_alpha", alpha.progress)
+                          .putInt("lk_color", colors[cs.selectedItemPosition].second)
+                          .putInt("lk_size", size.progress + 40)
+                          .putInt("lk_dim", dim.progress)
+                          .putBoolean("lk_date", cbDate.isChecked)
+                          .putBoolean("lk_24", cb24.isChecked)
+                          .putBoolean("lk_batt", cbBatt.isChecked)
+                          .putBoolean("lk_hint", cbHint.isChecked).apply()
+                  }
+                  AlertDialog.Builder(this).setTitle("Экран блокировки").setView(ScrollView(this).apply { addView(box) })
+                      .setPositiveButton("Сохранить") { _, _ -> save() }
+                      .setNeutralButton("Сохранить и посмотреть") { _, _ ->
+                          save(); startActivity(Intent(this, LockActivity::class.java))
                       }
                       .setNegativeButton("Отмена", null).show()
               }
@@ -873,8 +1008,8 @@ jobs:
                               }
                               val bmp = decode(uri)
                               WallpaperManager.getInstance(this).setBitmap(bmp, null, true, flags)
-                              saveGlass(bmp)
-                              if (wallTarget != 0) saveJpeg(bmp, "lockbg.jpg")
+                              if (wallTarget != 1) saveGlass(bmp)
+                              if (wallTarget != 0) { saveJpeg(bmp, "lockbg.jpg"); saveGlass(bmp, "lockglass.jpg") }
                               runOnUiThread { loadGlass(); applyGlass(); toast("Обои установлены") }
                           } catch (e: Throwable) {
                               runOnUiThread { toast("Ошибка: ${e.message}") }
@@ -917,6 +1052,8 @@ jobs:
 
                   // --- главный экран ---
                   val home = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  clockHolder = FrameLayout(this)
+                  home.addView(clockHolder, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
                   pager = ViewPager(this).apply {
                       layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
                       setPadding(dp(8), dp(8), dp(8), 0)
@@ -927,6 +1064,20 @@ jobs:
                   }
                   pager.adapter = PagesAdapter()
                   home.addView(pager)
+
+                  askPill = TextView(this).apply {
+                      text = "✦  Искать приложения"
+                      textSize = 14f; setTextColor(Color.parseColor("#33333A")); gravity = Gravity.CENTER
+                      setPadding(dp(22), dp(10), dp(22), dp(10))
+                      background = GradientDrawable().apply {
+                          cornerRadius = dp(24).toFloat(); setColor(Color.argb(170, 255, 255, 255)); setStroke(2, Color.argb(200, 255, 255, 255))
+                      }
+                      visibility = View.GONE
+                      setOnClickListener { openDrawer() }
+                  }
+                  home.addView(askPill, LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL
+                  ).apply { topMargin = dp(4) })
 
                   dots = TextView(this).apply {
                       gravity = Gravity.CENTER; setTextColor(Color.WHITE); textSize = 10f
@@ -1034,6 +1185,117 @@ jobs:
           }
           EOF_FILE
           mkdir -p app/src/main/java/com/example/homelauncher
+          cat > app/src/main/java/com/example/homelauncher/GlassClock.kt <<'EOF_FILE'
+          package com.example.homelauncher
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.LinearGradient
+          import android.graphics.Paint
+          import android.graphics.Rect
+          import android.graphics.RectF
+          import android.graphics.Shader
+          import android.graphics.Typeface
+          import android.view.View
+          import java.text.SimpleDateFormat
+          import java.util.Calendar
+          import java.util.Date
+          import java.util.Locale
+
+          /**
+           * Крупные узкие цифры с «стеклянным» градиентом (сверху плотно, вниз растворяются), как в Realme UI.
+           * framed = true: цифры в тонкой рамке с дугой в углу и маленькой датой (экран блокировки).
+           * stacked = true: часы и минуты в два этажа.
+           */
+          class GlassClockView(
+              ctx: Context,
+              private val stacked: Boolean,
+              private val framed: Boolean,
+              private val h24: Boolean,
+              private val light: Boolean,
+              private val showDate: Boolean = true
+          ) : View(ctx) {
+
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val r = Rect()
+              private val tick = object : Runnable {
+                  override fun run() { invalidate(); postDelayed(this, 1000) }
+              }
+
+              override fun onAttachedToWindow() { super.onAttachedToWindow(); post(tick) }
+              override fun onDetachedFromWindow() { removeCallbacks(tick); super.onDetachedFromWindow() }
+
+              private fun fit(c: Canvas, text: String, left: Float, top: Float, w: Float, h: Float, maxSy: Float) {
+                  p.textSize = 100f
+                  p.getTextBounds(text, 0, text.length, r)
+                  if (r.width() <= 0 || r.height() <= 0) return
+                  val k = w / r.width()
+                  val sy = minOf(h / (r.height() * k), maxSy)
+                  val topCol = if (light) Color.argb(240, 255, 255, 255) else Color.argb(240, 60, 60, 64)
+                  val botCol = if (light) Color.argb(40, 255, 255, 255) else Color.argb(25, 60, 60, 64)
+                  p.shader = LinearGradient(0f, r.top.toFloat(), 0f, r.bottom.toFloat(), topCol, botCol, Shader.TileMode.CLAMP)
+                  c.save()
+                  c.translate(left, top + (h - r.height() * k * sy) / 2f)
+                  c.scale(k, k * sy)
+                  c.drawText(text, -r.left.toFloat(), -r.top.toFloat(), p)
+                  c.restore()
+                  p.shader = null
+              }
+
+              override fun onDraw(c: Canvas) {
+                  val d = resources.displayMetrics.density
+                  val cal = Calendar.getInstance()
+                  var h = cal.get(if (h24) Calendar.HOUR_OF_DAY else Calendar.HOUR)
+                  if (!h24 && h == 0) h = 12
+                  val mm = "%02d".format(cal.get(Calendar.MINUTE))
+                  val hh = if (framed) "%02d".format(h) else h.toString()
+                  val w = width.toFloat()
+                  val ht = height.toFloat()
+
+                  p.typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+                  p.style = Paint.Style.FILL
+
+                  if (!framed) {
+                      fit(c, "$hh:$mm", 0f, 0f, w, ht, 1.6f)
+                      return
+                  }
+
+                  // рамка
+                  val rect = RectF(2 * d, 2 * d, w - 2 * d, ht - 2 * d)
+                  p.color = Color.argb(28, 255, 255, 255)
+                  c.drawRoundRect(rect, 16 * d, 16 * d, p)
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = 2 * d
+                  p.color = Color.argb(215, 255, 255, 255)
+                  c.drawRoundRect(rect, 16 * d, 16 * d, p)
+                  p.strokeWidth = 5 * d
+                  p.strokeCap = Paint.Cap.ROUND
+                  c.drawArc(RectF(rect.right - 32 * d, rect.bottom - 32 * d, rect.right, rect.bottom), 0f, 90f, false, p)
+                  p.strokeCap = Paint.Cap.BUTT
+                  p.style = Paint.Style.FILL
+
+                  val pad = 14 * d
+                  val topPad = if (showDate) 34 * d else pad
+                  if (stacked) {
+                      val gap = 8 * d
+                      val lh = (ht - topPad - pad - gap) / 2f
+                      fit(c, hh, pad, topPad, w - 2 * pad, lh, 2.4f)
+                      fit(c, mm, pad, topPad + lh + gap, w - 2 * pad, lh, 2.4f)
+                  } else {
+                      fit(c, hh + mm, pad, topPad, w - 2 * pad, ht - topPad - pad, 2.4f)
+                  }
+
+                  if (showDate) {
+                      p.typeface = Typeface.DEFAULT
+                      p.textSize = 12 * d
+                      p.color = Color.argb(225, 255, 255, 255)
+                      c.drawText(SimpleDateFormat("d MMM, EEE", Locale.getDefault()).format(Date()), pad, 24 * d, p)
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/homelauncher
           cat > app/src/main/java/com/example/homelauncher/LockActivity.kt <<'EOF_FILE'
           package com.example.homelauncher
 
@@ -1043,10 +1305,11 @@ jobs:
           import android.content.Context
           import android.content.Intent
           import android.content.IntentFilter
+          import android.graphics.Bitmap
           import android.graphics.BitmapFactory
           import android.graphics.Color
           import android.graphics.Typeface
-          import android.graphics.drawable.GradientDrawable
+          import android.os.BatteryManager
           import android.os.Build
           import android.os.Bundle
           import android.view.Gravity
@@ -1061,7 +1324,7 @@ jobs:
           import android.widget.TextView
           import java.io.File
 
-          /** Свой экран блокировки: показывается поверх системного, свайп вверх запускает системную разблокировку. */
+          /** Свой экран блокировки в стиле «стекло». Настройки берутся из SharedPreferences "home" (ключи lk_*). */
           class LockActivity : Activity() {
 
               private var downY = 0f
@@ -1072,6 +1335,11 @@ jobs:
               }
 
               private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun loadBmp(name: String): Bitmap? {
+                  val f = File(filesDir, name)
+                  return try { if (f.exists()) BitmapFactory.decodeFile(f.path) else null } catch (e: Throwable) { null }
+              }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -1094,49 +1362,122 @@ jobs:
                   if (Build.VERSION.SDK_INT >= 33) registerReceiver(unlocked, f, Context.RECEIVER_EXPORTED)
                   else registerReceiver(unlocked, f)
 
+                  // ---- настройки оформления ----
+                  val sp = getSharedPreferences("home", MODE_PRIVATE)
+                  val style = sp.getInt("lk_style", 0)
+                  val alpha = sp.getInt("lk_alpha", 50)
+                  val textColor = sp.getInt("lk_color", Color.WHITE)
+                  val timeSize = sp.getInt("lk_size", 80).toFloat()
+                  val showDate = sp.getBoolean("lk_date", true)
+                  val h24 = sp.getBoolean("lk_24", true)
+                  val showHint = sp.getBoolean("lk_hint", true)
+                  val showBatt = sp.getBoolean("lk_batt", true)
+                  val dim = sp.getInt("lk_dim", 60)
+                  val tint = Color.argb(alpha, 255, 255, 255)
+                  val lockGlass = loadBmp("lockglass.jpg")
+                  val shadow = if (textColor == Color.WHITE || Color.luminance(textColor) > 0.5f) Color.argb(110, 0, 0, 0) else Color.TRANSPARENT
+
+                  fun glass(v: View, radiusDp: Int) {
+                      v.background = GlassDrawable(v, dp(radiusDp).toFloat(), lockGlass, tint)
+                  }
+
                   val match = ViewGroup.LayoutParams.MATCH_PARENT
+                  val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
                   root = FrameLayout(this)
 
+                  // ---- фон ----
                   val bg = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
-                  val file = File(filesDir, "lockbg.jpg")
-                  val bmp = if (file.exists()) BitmapFactory.decodeFile(file.path) else null
+                  val bmp = loadBmp("lockbg.jpg")
                   if (bmp != null) bg.setImageBitmap(bmp) else bg.setBackgroundColor(Color.parseColor("#101018"))
                   root.addView(bg, FrameLayout.LayoutParams(match, match))
-                  root.addView(View(this).apply { setBackgroundColor(Color.argb(60, 0, 0, 0)) },
+                  root.addView(View(this).apply { setBackgroundColor(Color.argb(dim, 0, 0, 0)) },
                       FrameLayout.LayoutParams(match, match))
+
+                  // ---- часы и дата ----
+                  fun time(sizeSp: Float) = TextClock(this).apply {
+                      val fmt = if (h24) "HH:mm" else "h:mm"
+                      format24Hour = fmt; format12Hour = fmt
+                      textSize = sizeSp; setTextColor(textColor)
+                      typeface = Typeface.create("sans-serif-thin", Typeface.NORMAL)
+                      setShadowLayer(8f, 0f, 2f, shadow)
+                  }
+                  fun date(sizeSp: Float) = TextClock(this).apply {
+                      format24Hour = "EEEE, d MMMM"; format12Hour = "EEEE, d MMMM"
+                      textSize = sizeSp; setTextColor(textColor)
+                      setShadowLayer(6f, 0f, 1f, shadow)
+                  }
 
                   val col = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       gravity = Gravity.CENTER_HORIZONTAL
                       setPadding(0, dp(96), 0, 0)
                   }
-                  col.addView(TextClock(this).apply {
-                      format24Hour = "HH:mm"; format12Hour = "h:mm"
-                      textSize = 92f; setTextColor(Color.WHITE)
-                      typeface = Typeface.create("sans-serif-thin", Typeface.NORMAL)
-                      setShadowLayer(8f, 0f, 2f, Color.argb(120, 0, 0, 0))
-                  })
-                  col.addView(TextClock(this).apply {
-                      format24Hour = "EEEE, d MMMM"; format12Hour = "EEEE, d MMMM"
-                      textSize = 18f; setTextColor(Color.WHITE)
-                      setShadowLayer(6f, 0f, 1f, Color.argb(120, 0, 0, 0))
-                  })
-                  root.addView(col, FrameLayout.LayoutParams(match, match))
 
-                  val pill = TextView(this).apply {
-                      text = "⌃   Проведите вверх"
-                      textSize = 15f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
-                      setPadding(dp(28), dp(14), dp(28), dp(14))
-                      background = GradientDrawable().apply {
-                          cornerRadius = dp(28).toFloat()
-                          setColor(Color.argb(70, 255, 255, 255))
-                          setStroke(2, Color.argb(130, 255, 255, 255))
+                  when (style) {
+                      0 -> { // стеклянная карточка
+                          val card = LinearLayout(this).apply {
+                              orientation = LinearLayout.VERTICAL
+                              gravity = Gravity.CENTER_HORIZONTAL
+                              setPadding(dp(28), dp(22), dp(28), dp(22))
+                          }
+                          card.addView(time(timeSize))
+                          if (showDate) card.addView(date(18f))
+                          glass(card, 32)
+                          col.addView(card, LinearLayout.LayoutParams(match, wrap).apply { setMargins(dp(28), 0, dp(28), 0) })
+                      }
+                      1 -> { // крупные часы без панели
+                          col.addView(time(timeSize))
+                          if (showDate) col.addView(date(18f))
+                      }
+                      3, 4 -> { // как в Realme UI: цифры-стекло в рамке
+                          val stacked = style == 4
+                          val gv = GlassClockView(this, stacked, true, h24, true, showDate)
+                          val w = if (stacked) dp(210) else resources.displayMetrics.widthPixels - dp(56)
+                          val h = if (stacked) dp(330) else dp(190)
+                          col.addView(gv, LinearLayout.LayoutParams(w, h))
+                      }
+                      else -> { // компактная плашка
+                          val pill = LinearLayout(this).apply {
+                              orientation = LinearLayout.HORIZONTAL
+                              gravity = Gravity.CENTER_VERTICAL
+                              setPadding(dp(22), dp(10), dp(22), dp(10))
+                          }
+                          pill.addView(time(30f))
+                          if (showDate) {
+                              pill.addView(TextView(this).apply { text = "   "; textSize = 14f })
+                              pill.addView(date(15f))
+                          }
+                          glass(pill, 28)
+                          col.addView(pill, LinearLayout.LayoutParams(wrap, wrap))
                       }
                   }
-                  root.addView(pill, FrameLayout.LayoutParams(
-                      ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                      Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-                  ).apply { bottomMargin = dp(64) })
+
+                  if (showBatt) {
+                      val pct = try {
+                          getSystemService(BatteryManager::class.java).getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                      } catch (e: Throwable) { -1 }
+                      if (pct >= 0) {
+                          val b = TextView(this).apply {
+                              text = "🔋 $pct%"; textSize = 15f; setTextColor(textColor); gravity = Gravity.CENTER
+                              setPadding(dp(20), dp(8), dp(20), dp(8))
+                          }
+                          glass(b, 22)
+                          col.addView(b, LinearLayout.LayoutParams(wrap, wrap).apply { topMargin = dp(18) })
+                      }
+                  }
+                  root.addView(col, FrameLayout.LayoutParams(match, match))
+
+                  // ---- подсказка внизу ----
+                  if (showHint) {
+                      val hint = TextView(this).apply {
+                          text = "⌃   Проведите вверх"
+                          textSize = 15f; setTextColor(textColor); gravity = Gravity.CENTER
+                          setPadding(dp(28), dp(14), dp(28), dp(14))
+                      }
+                      glass(hint, 28)
+                      root.addView(hint, FrameLayout.LayoutParams(wrap, wrap, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+                          .apply { bottomMargin = dp(64) })
+                  }
 
                   root.setOnTouchListener { _, e ->
                       when (e.action) {
