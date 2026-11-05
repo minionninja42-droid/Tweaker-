@@ -1,0 +1,579 @@
+name: Theme Studio Launcher APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Generate Android project
+        shell: bash
+        run: |
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "ThemeStudioLauncher"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.6.1" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          EOF
+
+          mkdir -p app/src/main/java/com/example/themestudio app/src/main/res/values
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.themestudio"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.example.themestudio"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SET_WALLPAPER" />
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Theme Studio"
+                  android:theme="@style/AppTheme">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:label="Theme Studio"
+                      android:launchMode="singleTask">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:colorAccent">#6878F5</item>
+                  <item name="android:navigationBarColor">#10111A</item>
+                  <item name="android:statusBarColor">#10111A</item>
+                  <item name="android:windowLightStatusBar">false</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/java/com/example/themestudio/MainActivity.kt <<'EOF'
+          package com.example.themestudio
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.app.WallpaperManager
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Bundle
+          import android.text.TextUtils
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.FrameLayout
+          import android.widget.GridLayout
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.io.File
+          import java.io.FileOutputStream
+
+          class MainActivity : Activity() {
+
+              private data class Theme(
+                  val name: String,
+                  val background: Int,
+                  val accent: Int,
+                  val panel: Int,
+                  val darkText: Boolean
+              )
+
+              private val themes = listOf(
+                  Theme("HiOS", Color.rgb(19, 28, 48), Color.rgb(80, 174, 255), Color.argb(190, 26, 42, 67), false),
+                  Theme("iOS", Color.rgb(228, 235, 248), Color.rgb(77, 116, 245), Color.argb(205, 255, 255, 255), true),
+                  Theme("XOS", Color.rgb(31, 18, 46), Color.rgb(184, 104, 255), Color.argb(195, 54, 35, 75), false)
+              )
+
+              private val prefs by lazy { getSharedPreferences("theme_studio", Context.MODE_PRIVATE) }
+              private lateinit var root: FrameLayout
+              private lateinit var content: LinearLayout
+              private lateinit var appGrid: GridLayout
+              private lateinit var currentTheme: Theme
+              private var apps = emptyList<android.content.pm.ResolveInfo>()
+
+              private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+              private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
+              private fun textColor() = if (currentTheme.darkText) Color.rgb(29, 32, 43) else Color.WHITE
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  currentTheme = themes[prefs.getInt("theme", 1).coerceIn(themes.indices)]
+                  val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  apps = packageManager.queryIntentActivities(intent, 0)
+                      .filter { it.activityInfo.packageName != packageName }
+                      .distinctBy { it.activityInfo.packageName }
+                      .sortedBy { it.loadLabel(packageManager).toString().lowercase() }
+
+                  buildScreen()
+              }
+
+              private fun rounded(color: Int, radius: Int, stroke: Int = Color.TRANSPARENT) = GradientDrawable().apply {
+                  setColor(color)
+                  cornerRadius = dp(radius).toFloat()
+                  if (stroke != Color.TRANSPARENT) setStroke(dp(1), stroke)
+              }
+
+              private fun buildScreen() {
+                  root = FrameLayout(this)
+
+                  val wallpaper = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+                  val photo = File(filesDir, "wallpaper.jpg")
+                  if (photo.exists()) {
+                      try {
+                          wallpaper.setImageBitmap(BitmapFactory.decodeFile(photo.absolutePath))
+                      } catch (_: Exception) {
+                      }
+                  } else {
+                      wallpaper.setBackgroundColor(currentTheme.background)
+                  }
+
+                  root.addView(wallpaper, FrameLayout.LayoutParams(-1, -1))
+                  root.addView(View(this).apply {
+                      setBackgroundColor(if (photo.exists()) Color.argb(75, 0, 0, 0) else currentTheme.background)
+                  }, FrameLayout.LayoutParams(-1, -1))
+
+                  content = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(18), dp(28), dp(18), dp(16))
+                  }
+                  root.addView(content, FrameLayout.LayoutParams(-1, -1))
+
+                  val top = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "Theme Studio"
+                      textSize = 25f
+                      setTextColor(textColor())
+                      typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+                  }
+                  top.addView(title)
+
+                  top.addView(TextView(this).apply {
+                      text = "⚙"
+                      textSize = 27f
+                      gravity = Gravity.CENTER
+                      setTextColor(textColor())
+                      setPadding(dp(10), dp(4), dp(10), dp(4))
+                      setOnClickListener { settingsDialog() }
+                      contentDescription = "Настройки лаунчера"
+                  })
+                  content.addView(top)
+
+                  val themeStrip = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      setPadding(0, dp(18), 0, dp(14))
+                  }
+
+                  themes.forEachIndexed { index, theme ->
+                      val chip = TextView(this).apply {
+                          text = if (prefs.getInt("theme", 1) == index) "✓  ${theme.name}" else theme.name
+                          textSize = 14f
+                          gravity = Gravity.CENTER
+                          setTextColor(if (theme.darkText) Color.rgb(31, 35, 48) else Color.WHITE)
+                          background = rounded(theme.panel, 22, theme.accent)
+                          setPadding(dp(16), dp(10), dp(16), dp(10))
+                          setOnClickListener {
+                              prefs.edit().putInt("theme", index).apply()
+                              currentTheme = theme
+                              buildScreen()
+                          }
+                      }
+
+                      themeStrip.addView(chip, LinearLayout.LayoutParams(0, -2, 1f).apply {
+                          if (index > 0) leftMargin = dp(6)
+                          if (index < themes.lastIndex) rightMargin = dp(6)
+                      })
+                  }
+
+                  content.addView(themeStrip)
+
+                  val date = TextView(this).apply {
+                      text = "${apps.size} приложений · ${currentTheme.name} Theme"
+                      textSize = 13f
+                      setTextColor(textColor())
+                      alpha = 0.88f
+                      setPadding(dp(4), 0, 0, dp(8))
+                  }
+                  content.addView(date)
+
+                  val scroller = ScrollView(this).apply { isFillViewport = false }
+                  appGrid = GridLayout(this).apply {
+                      columnCount = prefs.getInt("columns", 4).coerceIn(3, 6)
+                      useDefaultMargins = false
+                  }
+                  populateApps()
+                  scroller.addView(appGrid)
+                  content.addView(scroller, LinearLayout.LayoutParams(-1, 0, 1f))
+
+                  val dock = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      background = rounded(Color.argb(prefs.getInt("dock_alpha", 175), 255, 255, 255), 28, Color.argb(80, 255, 255, 255))
+                      setPadding(dp(10), dp(8), dp(10), dp(8))
+                  }
+
+                  val dockCount = prefs.getInt("dock_count", 4).coerceIn(2, 5)
+                  apps.take(dockCount).forEach { info ->
+                      val icon = ImageView(this).apply {
+                          setImageDrawable(info.loadIcon(packageManager))
+                          scaleType = ImageView.ScaleType.FIT_CENTER
+                          setPadding(dp(7), dp(7), dp(7), dp(7))
+                          setOnClickListener { launchApp(info) }
+                          contentDescription = info.loadLabel(packageManager).toString()
+                      }
+                      dock.addView(icon, LinearLayout.LayoutParams(0, dp(54), 1f))
+                  }
+
+                  content.addView(dock, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+
+                  setContentView(root)
+              }
+
+              private fun populateApps() {
+                  appGrid.removeAllViews()
+                  val columns = prefs.getInt("columns", 4).coerceIn(3, 6)
+                  appGrid.columnCount = columns
+                  val iconDp = prefs.getInt("icon_size", 52).coerceIn(40, 76)
+                  val labels = prefs.getBoolean("labels", true)
+                  val pad = dp(5)
+
+                  apps.forEach { info ->
+                      val cell = LinearLayout(this).apply {
+                          orientation = LinearLayout.VERTICAL
+                          gravity = Gravity.CENTER
+                          setPadding(pad, dp(8), pad, dp(8))
+                      }
+
+                      val icon = ImageView(this).apply {
+                          setImageDrawable(info.loadIcon(packageManager))
+                          scaleType = ImageView.ScaleType.FIT_CENTER
+                          val shape = prefs.getInt("icon_shape", 0)
+                          if (shape > 0) {
+                              background = rounded(Color.argb(80, 255, 255, 255), if (shape == 1) 18 else 999)
+                          }
+                          setPadding(
+                              if (shape > 0) dp(6) else 0,
+                              if (shape > 0) dp(6) else 0,
+                              if (shape > 0) dp(6) else 0,
+                              if (shape > 0) dp(6) else 0
+                          )
+                      }
+
+                      cell.addView(icon, LinearLayout.LayoutParams(dp(iconDp), dp(iconDp)))
+
+                      if (labels) {
+                          cell.addView(TextView(this).apply {
+                              text = info.loadLabel(packageManager)
+                              textSize = 11f
+                              setTextColor(textColor())
+                              gravity = Gravity.CENTER
+                              maxLines = 1
+                              ellipsize = TextUtils.TruncateAt.END
+                              setShadowLayer(3f, 0f, 1f, Color.BLACK)
+                          }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+                      }
+
+                      cell.setOnClickListener { launchApp(info) }
+                      cell.contentDescription = info.loadLabel(packageManager).toString()
+
+                      appGrid.addView(cell, GridLayout.LayoutParams().apply {
+                          width = 0
+                          height = -2
+                          columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
+                          setMargins(dp(2), dp(2), dp(2), dp(2))
+                      })
+                  }
+              }
+
+              private fun launchApp(info: android.content.pm.ResolveInfo) {
+                  val launch = packageManager.getLaunchIntentForPackage(info.activityInfo.packageName)
+                  if (launch != null) {
+                      try {
+                          startActivity(launch)
+                      } catch (_: Exception) {
+                          toast("Не удалось открыть приложение")
+                      }
+                  }
+              }
+
+              private fun settingsDialog() {
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(4), dp(20), 0)
+                  }
+
+                  fun caption(label: String) = TextView(this).apply {
+                      text = label
+                      textSize = 14f
+                      setTextColor(Color.DKGRAY)
+                      setPadding(0, dp(10), 0, dp(2))
+                  }
+
+                  fun slider(label: String, max: Int, value: Int, summary: (Int) -> String, onChange: (Int) -> Unit) {
+                      val valueText = TextView(this).apply {
+                          text = "$label: ${summary(value)}"
+                          setTextColor(Color.DKGRAY)
+                      }
+                      box.addView(valueText)
+
+                      box.addView(SeekBar(this).apply {
+                          this.max = max
+                          progress = value
+                          setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                              override fun onProgressChanged(seekBar: SeekBar?, progress: Int, progressFromUser: Boolean) {
+                                  valueText.text = "$label: ${summary(progress)}"
+                                  onChange(progress)
+                              }
+                              override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                              override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+                          })
+                      })
+                  }
+
+                  var columns = prefs.getInt("columns", 4)
+                  var iconSize = prefs.getInt("icon_size", 52)
+                  var dockAlpha = prefs.getInt("dock_alpha", 175)
+                  var dockCount = prefs.getInt("dock_count", 4)
+                  var labels = prefs.getBoolean("labels", true)
+                  var iconShape = prefs.getInt("icon_shape", 0)
+
+                  box.addView(caption("Сетка иконок"))
+                  slider("Колонки", 3, columns - 3, { (it + 3).toString() }) { columns = it + 3 }
+                  slider("Размер иконок", 36, iconSize - 40, { "${it + 40} dp" }) { iconSize = it + 40 }
+                  slider("Количество значков в доке", 3, dockCount - 2, { (it + 2).toString() }) { dockCount = it + 2 }
+                  slider("Прозрачность дока", 255, dockAlpha, { "$it / 255" }) { dockAlpha = it }
+
+                  val labelsBox = CheckBox(this).apply {
+                      text = "Показывать подписи приложений"
+                      isChecked = labels
+                  }
+                  box.addView(labelsBox)
+
+                  box.addView(caption("Форма значков"))
+                  val shapes = arrayOf("Оригинальная", "Скруглённая плитка", "Круглая плитка")
+                  val shapeButtons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+
+                  shapes.forEachIndexed { i, name ->
+                      val button = Button(this).apply {
+                          text = name
+                          textSize = 10f
+                          setOnClickListener {
+                              iconShape = i
+                              toast("Форма: $name")
+                          }
+                      }
+                      shapeButtons.addView(button, LinearLayout.LayoutParams(0, -2, 1f))
+                  }
+                  box.addView(shapeButtons)
+
+                  box.addView(caption("Обои"))
+                  box.addView(Button(this).apply {
+                      text = "Выбрать фото из галереи"
+                      setOnClickListener { pickWallpaper() }
+                  })
+                  box.addView(Button(this).apply {
+                      text = "Применить фото как системные обои"
+                      setOnClickListener { applySystemWallpaper() }
+                  })
+
+                  val dialog = AlertDialog.Builder(this)
+                      .setTitle("Настройки лаунчера")
+                      .setView(ScrollView(this).apply { addView(box) })
+                      .setPositiveButton("Сохранить", null)
+                      .setNegativeButton("Закрыть", null)
+                      .create()
+
+                  dialog.setOnShowListener {
+                      dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                          labels = labelsBox.isChecked
+                          prefs.edit()
+                              .putInt("columns", columns)
+                              .putInt("icon_size", iconSize)
+                              .putInt("dock_alpha", dockAlpha)
+                              .putInt("dock_count", dockCount)
+                              .putBoolean("labels", labels)
+                              .putInt("icon_shape", iconShape)
+                              .apply()
+
+                          dialog.dismiss()
+                          buildScreen()
+                      }
+                  }
+
+                  dialog.show()
+              }
+
+              private fun pickWallpaper() {
+                  val pick = Intent(Intent.ACTION_GET_CONTENT).apply { type = "image/*" }
+                  try {
+                      startActivityForResult(Intent.createChooser(pick, "Выберите фото для темы"), 41)
+                  } catch (_: Exception) {
+                      toast("Не удалось открыть галерею")
+                  }
+              }
+
+              private fun applySystemWallpaper() {
+                  val file = File(filesDir, "wallpaper.jpg")
+                  if (!file.exists()) {
+                      toast("Сначала выберите фото в настройках")
+                      return
+                  }
+
+                  try {
+                      file.inputStream().use {
+                          WallpaperManager.getInstance(this).setStream(
+                              it,
+                              null,
+                              true,
+                              WallpaperManager.FLAG_SYSTEM or WallpaperManager.FLAG_LOCK
+                          )
+                      }
+                      toast("Фото установлено как обои")
+                  } catch (e: Exception) {
+                      toast("Не удалось установить обои: ${e.message ?: "ошибка"}")
+                  }
+              }
+
+              @Deprecated("Deprecated in Android API 30")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != 41 || resultCode != RESULT_OK) return
+
+                  val uri: Uri = data?.data ?: return
+                  try {
+                      contentResolver.openInputStream(uri).use { input ->
+                          if (input == null) throw IllegalStateException("Не удалось прочитать изображение")
+                          FileOutputStream(File(filesDir, "wallpaper.jpg")).use { output ->
+                              input.copyTo(output)
+                          }
+                      }
+                      toast("Фото сохранено. Выберите «Применить фото» или вернитесь на главный экран.")
+                      buildScreen()
+                  } catch (e: Exception) {
+                      toast("Ошибка загрузки фото: ${e.message ?: \"неизвестная ошибка\"}")
+                  }
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: gradle --no-daemon clean assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Theme-Studio-Launcher
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
