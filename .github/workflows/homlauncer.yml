@@ -1,0 +1,1597 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Accept Android licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "HomeLauncher"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=true
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.homelauncher"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.homelauncher"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "2.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.viewpager:viewpager:1.0.0")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SET_WALLPAPER" />
+              <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+              <application
+                  android:label="Home Launcher"
+                  android:theme="@style/AppTheme">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:stateNotNeeded="true"
+                      android:windowSoftInputMode="adjustPan">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <activity
+                      android:name=".LockActivity"
+                      android:exported="false"
+                      android:launchMode="singleInstance"
+                      android:excludeFromRecents="true"
+                      android:showWhenLocked="true"
+                      android:turnScreenOn="true"
+                      android:taskAffinity=""
+                      android:theme="@android:style/Theme.Material.NoActionBar" />
+                  <service
+                      android:name=".LockService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="custom_lock_screen" />
+                  </service>
+                  <receiver android:name=".BootReceiver" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/styles.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.Material.Wallpaper.NoTitleBar">
+                  <item name="android:windowIsTranslucent">true</item>
+                  <item name="android:windowShowWallpaper">true</item>
+                  <item name="android:windowBackground">@android:color/transparent</item>
+                  <item name="android:statusBarColor">@android:color/transparent</item>
+                  <item name="android:navigationBarColor">@android:color/transparent</item>
+              </style>
+          </resources>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/homelauncher
+          cat > app/src/main/java/com/example/homelauncher/MainActivity.kt <<'EOF_FILE'
+          package com.example.homelauncher
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.app.WallpaperManager
+          import android.appwidget.AppWidgetHost
+          import android.appwidget.AppWidgetManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.ColorFilter
+          import android.graphics.LinearGradient
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.Rect
+          import android.graphics.RectF
+          import android.graphics.Shader
+          import android.graphics.ColorMatrix
+          import android.graphics.ColorMatrixColorFilter
+          import android.graphics.drawable.AdaptiveIconDrawable
+          import android.graphics.drawable.ColorDrawable
+          import android.graphics.drawable.Drawable
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.Editable
+          import android.text.InputType
+          import android.text.TextUtils
+          import android.text.TextWatcher
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.*
+          import androidx.viewpager.widget.PagerAdapter
+          import androidx.viewpager.widget.ViewPager
+          import java.io.File
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import kotlin.concurrent.thread
+          import kotlin.math.ceil
+
+          /** Страница рабочего стола: сетка ячеек, элементы ставятся по координатам. */
+          class CellLayout(ctx: Context, private val cols: Int, private val rows: Int) : ViewGroup(ctx) {
+              class LP(var x: Int, var y: Int, var w: Int, var h: Int) :
+                  ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+
+              var lastX = 0f
+              var lastY = 0f
+
+              override fun checkLayoutParams(p: ViewGroup.LayoutParams?) = p is LP
+
+              override fun onMeasure(ws: Int, hs: Int) {
+                  val w = View.MeasureSpec.getSize(ws)
+                  val h = View.MeasureSpec.getSize(hs)
+                  setMeasuredDimension(w, h)
+                  val cw = w / cols
+                  val ch = h / rows
+                  for (i in 0 until childCount) {
+                      val c = getChildAt(i)
+                      val lp = c.layoutParams as LP
+                      c.measure(
+                          View.MeasureSpec.makeMeasureSpec(cw * lp.w, View.MeasureSpec.EXACTLY),
+                          View.MeasureSpec.makeMeasureSpec(ch * lp.h, View.MeasureSpec.EXACTLY)
+                      )
+                  }
+              }
+
+              override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
+                  val cw = (r - l) / cols
+                  val ch = (b - t) / rows
+                  for (i in 0 until childCount) {
+                      val c = getChildAt(i)
+                      val lp = c.layoutParams as LP
+                      c.layout(lp.x * cw, lp.y * ch, (lp.x + lp.w) * cw, (lp.y + lp.h) * ch)
+                  }
+              }
+
+              fun cellX(x: Float) = (x / (width / cols)).toInt().coerceIn(0, cols - 1)
+              fun cellY(y: Float) = (y / (height / rows)).toInt().coerceIn(0, rows - 1)
+          }
+
+          /** «Стекло»: кусок размытых обоев под панелью + белая вуаль, блик и светлая рамка. */
+          class GlassDrawable(
+              private val v: View,
+              private val radius: Float,
+              private val blur: Bitmap?,
+              private val tint: Int
+          ) : Drawable() {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val path = Path()
+              private val loc = IntArray(2)
+
+              override fun draw(c: Canvas) {
+                  val b = bounds
+                  val rect = RectF(b)
+                  path.reset()
+                  path.addRoundRect(rect, radius, radius, Path.Direction.CW)
+                  c.save()
+                  c.clipPath(path)
+                  if (blur != null) {
+                      v.getLocationOnScreen(loc)
+                      val dm = v.resources.displayMetrics
+                      val sx = blur.width.toFloat() / dm.widthPixels
+                      val sy = blur.height.toFloat() / dm.heightPixels
+                      val src = Rect(
+                          (loc[0] * sx).toInt(), (loc[1] * sy).toInt(),
+                          ((loc[0] + b.width()) * sx).toInt(), ((loc[1] + b.height()) * sy).toInt()
+                      )
+                      c.drawBitmap(blur, src, b, null)
+                  }
+                  p.style = Paint.Style.FILL
+                  p.color = tint
+                  c.drawRect(rect, p)
+                  p.shader = LinearGradient(
+                      0f, rect.top, 0f, rect.bottom,
+                      Color.argb(70, 255, 255, 255), Color.argb(0, 255, 255, 255), Shader.TileMode.CLAMP
+                  )
+                  c.drawRect(rect, p)
+                  p.shader = null
+                  c.restore()
+                  if (radius > 0f) {
+                      p.style = Paint.Style.STROKE
+                      p.strokeWidth = 2f
+                      p.color = Color.argb(120, 255, 255, 255)
+                      c.drawPath(path, p)
+                  }
+              }
+
+              override fun setAlpha(a: Int) {}
+              override fun setColorFilter(f: ColorFilter?) {}
+              @Suppress("OVERRIDE_DEPRECATION")
+              override fun getOpacity() = PixelFormat.TRANSLUCENT
+          }
+
+          /** Рамка поверх элемента: тяните за середину — двигать, за белые точки — менять размер (только виджеты). */
+          class ResizeOverlay(
+              ctx: Context,
+              private val resizable: Boolean,
+              private val onDrag: (dx: Float, dy: Float, rw: Boolean, rh: Boolean, mv: Boolean, done: Boolean) -> Unit
+          ) : View(ctx) {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private var sx = 0f
+              private var sy = 0f
+              private var rw = false
+              private var rh = false
+              private var mv = false
+
+              override fun onDraw(c: Canvas) {
+                  val d = resources.displayMetrics.density
+                  p.style = Paint.Style.FILL
+                  p.color = Color.argb(40, 255, 255, 255)
+                  c.drawRoundRect(RectF(2 * d, 2 * d, width - 2 * d, height - 2 * d), 12 * d, 12 * d, p)
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = 3 * d
+                  p.color = Color.WHITE
+                  c.drawRoundRect(RectF(2 * d, 2 * d, width - 2 * d, height - 2 * d), 12 * d, 12 * d, p)
+                  if (resizable) {
+                      p.style = Paint.Style.FILL
+                      c.drawCircle(width - 2 * d, height / 2f, 10 * d, p)
+                      c.drawCircle(width / 2f, height - 2 * d, 10 * d, p)
+                      c.drawCircle(width - 2 * d, height - 2 * d, 13 * d, p)
+                  }
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  val d = resources.displayMetrics.density
+                  when (e.action) {
+                      MotionEvent.ACTION_DOWN -> {
+                          parent.requestDisallowInterceptTouchEvent(true)
+                          sx = e.rawX; sy = e.rawY
+                          rw = resizable && e.x > width - 44 * d
+                          rh = resizable && e.y > height - 44 * d
+                          mv = !rw && !rh
+                      }
+                      MotionEvent.ACTION_MOVE -> onDrag(e.rawX - sx, e.rawY - sy, rw, rh, mv, false)
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> onDrag(e.rawX - sx, e.rawY - sy, rw, rh, mv, true)
+                  }
+                  return true
+              }
+          }
+
+          class MainActivity : Activity() {
+
+              data class App(val pkg: String, val label: String, val icon: Drawable, val mono: Drawable? = null)
+              data class Item(val type: String, var page: Int, var x: Int, var y: Int, var w: Int, var h: Int, val ref: String)
+
+              private val C = 4
+              private val R = 6
+
+              private lateinit var prefs: SharedPreferences
+              private lateinit var awm: AppWidgetManager
+              private lateinit var host: AppWidgetHost
+              private lateinit var root: FrameLayout
+              private lateinit var pager: ViewPager
+              private lateinit var dots: TextView
+              private lateinit var dock: LinearLayout
+              private lateinit var clockHolder: FrameLayout
+              private lateinit var askPill: TextView
+              private lateinit var drawer: LinearLayout
+              private lateinit var grid: GridView
+              private lateinit var search: EditText
+              private lateinit var adapter: AppAdapter
+
+              private val all = mutableListOf<App>()
+              private val shown = mutableListOf<App>()
+              private val items = mutableListOf<Item>()
+              private var pageCount = 2
+              private var moving: Item? = null
+              private var resizing: Item? = null
+              private var pendingId = -1
+              private var wallTarget = 0
+              private var glassBmp: Bitmap? = null
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+              private fun launch(pkg: String) { packageManager.getLaunchIntentForPackage(pkg)?.let { startActivity(it) } }
+
+              // ================= данные =================
+
+              private fun loadItems() {
+                  items.clear()
+                  val arr = JSONArray(prefs.getString("items", "[]"))
+                  for (i in 0 until arr.length()) {
+                      val o = arr.getJSONObject(i)
+                      items.add(Item(o.getString("t"), o.getInt("p"), o.getInt("x"), o.getInt("y"), o.getInt("w"), o.getInt("h"), o.getString("r")))
+                  }
+              }
+
+              private fun saveItems() {
+                  val arr = JSONArray()
+                  for (it in items) {
+                      arr.put(JSONObject().put("t", it.type).put("p", it.page).put("x", it.x).put("y", it.y)
+                          .put("w", it.w).put("h", it.h).put("r", it.ref))
+                  }
+                  prefs.edit().putString("items", arr.toString()).apply()
+              }
+
+              private fun dockList() = (prefs.getString("dock", "") ?: "").split(",").filter { it.isNotEmpty() }
+              private fun saveDock(l: List<String>) = prefs.edit().putString("dock", l.joinToString(",")).apply()
+
+              private fun isFree(page: Int, x: Int, y: Int, w: Int, h: Int, ignore: Item?): Boolean {
+                  if (x < 0 || y < 0 || x + w > C || y + h > R) return false
+                  return items.none {
+                      it !== ignore && it.page == page &&
+                          x < it.x + it.w && it.x < x + w && y < it.y + it.h && it.y < y + h
+                  }
+              }
+
+              private fun placeNew(type: String, ref: String, w: Int, h: Int): Boolean {
+                  val cur = pager.currentItem
+                  val order = listOf(cur) + (0 until pageCount).filter { it != cur }
+                  for (p in order) {
+                      for (y in 0..(R - h)) for (x in 0..(C - w)) {
+                          if (isFree(p, x, y, w, h, null)) {
+                              items.add(Item(type, p, x, y, w, h, ref))
+                              saveItems()
+                              return true
+                          }
+                      }
+                  }
+                  toast("Нет места на рабочем столе")
+                  return false
+              }
+
+              private fun loadApps() {
+                  thread {
+                      val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                      val list = packageManager.queryIntentActivities(q, 0)
+                          .filter { it.activityInfo.packageName != packageName }
+                          .map {
+                              val ic = it.loadIcon(packageManager)
+                              val mono = if (Build.VERSION.SDK_INT >= 33 && ic is AdaptiveIconDrawable) ic.monochrome else null
+                              App(it.activityInfo.packageName, it.loadLabel(packageManager).toString(), ic, mono)
+                          }
+                          .distinctBy { it.pkg }
+                          .sortedBy { it.label.lowercase() }
+                      runOnUiThread {
+                          val changed = list.map { it.pkg } != all.map { it.pkg }
+                          all.clear(); all.addAll(list)
+                          // чистим удалённые приложения и виджеты
+                          val before = items.size
+                          items.removeAll { i ->
+                              (i.type == "app" && all.none { it.pkg == i.ref }) ||
+                                  (i.type == "widget" && awm.getAppWidgetInfo(i.ref.toInt()) == null)
+                          }
+                          if (items.size != before) saveItems()
+                          applyFilter(); buildDock()
+                          if (changed || items.size != before) refreshHome()
+                      }
+                  }
+              }
+
+              private fun applyFilter() {
+                  val hidden = prefs.getStringSet("hidden", emptySet())!!
+                  val q = search.text.toString().trim().lowercase()
+                  shown.clear()
+                  shown.addAll(all.filter { it.pkg !in hidden && it.label.lowercase().contains(q) })
+                  adapter.notifyDataSetChanged()
+              }
+
+              // ================= рабочий стол =================
+
+              private fun refreshHome() {
+                  pager.adapter?.notifyDataSetChanged()
+                  updateDots()
+              }
+
+              private fun updateDots() {
+                  dots.text = (0 until pageCount).joinToString("  ") { if (it == pager.currentItem) "●" else "○" }
+              }
+
+              private fun iconImage(a: App, size: Int): ImageView {
+                  val iv = ImageView(this).apply { layoutParams = LinearLayout.LayoutParams(size, size) }
+                  if (prefs.getBoolean("realme", false)) {
+                      val pad = (size * 0.2f).toInt()
+                      iv.setPadding(pad, pad, pad, pad)
+                      iv.background = GradientDrawable(
+                          GradientDrawable.Orientation.TOP_BOTTOM,
+                          intArrayOf(Color.argb(238, 255, 255, 255), Color.argb(195, 232, 232, 238))
+                      ).apply { cornerRadius = size * 0.3f; setStroke(2, Color.argb(170, 255, 255, 255)) }
+                      val mono = a.mono
+                      if (mono != null) {
+                          iv.setImageDrawable(mono)
+                          iv.setColorFilter(Color.parseColor("#4A4A50"))
+                      } else {
+                          iv.setImageDrawable(a.icon)
+                          iv.colorFilter = ColorMatrixColorFilter(ColorMatrix().apply { setSaturation(0f) })
+                      }
+                  } else iv.setImageDrawable(a.icon)
+                  return iv
+              }
+
+              private fun iconView(a: App, onClick: () -> Unit, onLong: () -> Unit): View {
+                  val size = dp(prefs.getInt("icon", 56))
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setOnClickListener { onClick() }
+                      setOnLongClickListener { onLong(); true }
+                  }
+                  col.addView(iconImage(a, size))
+                  if (prefs.getBoolean("labels", true)) {
+                      col.addView(TextView(this).apply {
+                          text = a.label; setTextColor(Color.WHITE); textSize = 12f
+                          maxLines = 1; ellipsize = TextUtils.TruncateAt.END; gravity = Gravity.CENTER
+                          setShadowLayer(4f, 0f, 1f, Color.BLACK)
+                          setPadding(dp(2), dp(4), dp(2), 0)
+                      })
+                  }
+                  return col
+              }
+
+              private fun makeView(item: Item): View? {
+                  if (item.type == "app") {
+                      val a = all.firstOrNull { it.pkg == item.ref } ?: return null
+                      return iconView(a, { launch(a.pkg) }, { itemMenu(item) })
+                  }
+                  val id = item.ref.toInt()
+                  val info = awm.getAppWidgetInfo(id) ?: return null
+                  val hv = host.createView(this, id, info)
+                  val dm = resources.displayMetrics
+                  val wDp = (dm.widthPixels / C * item.w / dm.density).toInt()
+                  val hDp = (dm.heightPixels * 0.62f / R * item.h / dm.density).toInt()
+                  hv.updateAppWidgetSize(Bundle(), wDp, hDp, wDp, hDp)
+                  hv.setOnLongClickListener { itemMenu(item); true }
+                  return hv
+              }
+
+              private fun buildPage(pos: Int): View {
+                  val cl = CellLayout(this, C, R)
+                  cl.isClickable = true
+                  cl.isLongClickable = true
+                  cl.setOnTouchListener { _, e ->
+                      if (e.action == MotionEvent.ACTION_DOWN) { cl.lastX = e.x; cl.lastY = e.y }
+                      false
+                  }
+                  cl.setOnLongClickListener { homeMenu(); true }
+                  cl.setOnClickListener {
+                      if (resizing != null) {
+                          resizing = null; refreshHome()
+                      } else {
+                          val m = moving
+                          if (m != null) moveTo(m, pos, cl.cellX(cl.lastX), cl.cellY(cl.lastY))
+                      }
+                  }
+                  val views = java.util.IdentityHashMap<Item, View>()
+                  for (item in items.filter { it.page == pos }) {
+                      makeView(item)?.let {
+                          views[item] = it
+                          cl.addView(it, CellLayout.LP(item.x, item.y, item.w, item.h))
+                      }
+                  }
+                  val rz = resizing
+                  if (rz != null && rz.page == pos) {
+                      val wv = views[rz]
+                      val ovLp = CellLayout.LP(rz.x, rz.y, rz.w, rz.h)
+                      var bw = rz.w
+                      var bh = rz.h
+                      var bx = rz.x
+                      var by = rz.y
+                      val ov = ResizeOverlay(this, rz.type == "widget") { dx, dy, rw, rh, mv, done ->
+                          val cw = maxOf(1, cl.width / C)
+                          val ch = maxOf(1, cl.height / R)
+                          if (mv) {
+                              val nx = (bx + Math.round(dx / cw)).coerceIn(0, C - rz.w)
+                              val ny = (by + Math.round(dy / ch)).coerceIn(0, R - rz.h)
+                              if ((nx != rz.x || ny != rz.y) && isFree(rz.page, nx, ny, rz.w, rz.h, rz)) {
+                                  rz.x = nx; rz.y = ny
+                                  ovLp.x = nx; ovLp.y = ny
+                                  (wv?.layoutParams as? CellLayout.LP)?.let { lp -> lp.x = nx; lp.y = ny }
+                                  cl.requestLayout()
+                              }
+                          } else {
+                              val nw = if (rw) (bw + Math.round(dx / cw)).coerceIn(1, C - rz.x) else bw
+                              val nh = if (rh) (bh + Math.round(dy / ch)).coerceIn(1, R - rz.y) else bh
+                              if ((nw != rz.w || nh != rz.h) && isFree(rz.page, rz.x, rz.y, nw, nh, rz)) {
+                                  rz.w = nw; rz.h = nh
+                                  ovLp.w = nw; ovLp.h = nh
+                                  (wv?.layoutParams as? CellLayout.LP)?.let { lp -> lp.w = nw; lp.h = nh }
+                                  cl.requestLayout()
+                              }
+                          }
+                          if (done) {
+                              bw = rz.w; bh = rz.h; bx = rz.x; by = rz.y
+                              saveItems(); refreshHome()
+                          }
+                      }
+                      cl.addView(ov, ovLp)
+                  }
+                  return cl
+              }
+
+              inner class PagesAdapter : PagerAdapter() {
+                  override fun getCount() = pageCount
+                  override fun isViewFromObject(v: View, obj: Any) = v === obj
+                  override fun instantiateItem(container: ViewGroup, position: Int): Any {
+                      val v = buildPage(position)
+                      container.addView(v)
+                      return v
+                  }
+                  override fun destroyItem(container: ViewGroup, position: Int, obj: Any) {
+                      container.removeView(obj as View)
+                  }
+                  override fun getItemPosition(obj: Any) = POSITION_NONE
+              }
+
+              private fun moveTo(item: Item, page: Int, cx: Int, cy: Int) {
+                  val x = minOf(cx, C - item.w)
+                  val y = minOf(cy, R - item.h)
+                  if (isFree(page, x, y, item.w, item.h, item)) {
+                      item.page = page; item.x = x; item.y = y
+                      moving = null
+                      saveItems(); refreshHome()
+                  } else toast("Место занято, выберите другое")
+              }
+
+              private fun itemMenu(item: Item) {
+                  val widget = item.type == "widget"
+                  val opts = arrayOf(
+                      if (widget) "Двигать пальцем / менять размер" else "Двигать пальцем",
+                      "На другую страницу",
+                      if (widget) "Удалить" else "Убрать с рабочего стола"
+                  )
+                  AlertDialog.Builder(this).setItems(opts) { _, i ->
+                      when (i) {
+                          0 -> {
+                              resizing = item; refreshHome()
+                              toast(if (widget) "Тяните за середину, чтобы двигать, за точки — менять размер. Нажмите вне рамки, чтобы закончить"
+                                    else "Тяните иконку пальцем. Нажмите вне рамки, чтобы закончить")
+                          }
+                          1 -> { moving = item; toast("Нажмите на свободное место (можно на другой странице)") }
+                          else -> {
+                              if (widget) host.deleteAppWidgetId(item.ref.toInt())
+                              items.remove(item); saveItems(); refreshHome()
+                          }
+                      }
+                  }.show()
+              }
+
+              private fun resizeDialog(item: Item) {
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(10), dp(20), 0) }
+                  val ws = (1..C).toList()
+                  val hs = (1..R).toList()
+                  val sw = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, ws.map { "Ширина: $it" })
+                      setSelection(item.w - 1)
+                  }
+                  val sh = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, hs.map { "Высота: $it" })
+                      setSelection(item.h - 1)
+                  }
+                  box.addView(sw); box.addView(sh)
+                  AlertDialog.Builder(this).setTitle("Размер виджета (в ячейках)").setView(box)
+                      .setPositiveButton("Применить") { _, _ ->
+                          val nw = ws[sw.selectedItemPosition]
+                          val nh = hs[sh.selectedItemPosition]
+                          val nx = minOf(item.x, C - nw)
+                          val ny = minOf(item.y, R - nh)
+                          if (isFree(item.page, nx, ny, nw, nh, item)) {
+                              item.w = nw; item.h = nh; item.x = nx; item.y = ny
+                              saveItems(); refreshHome()
+                          } else toast("Не помещается, место занято")
+                      }
+                      .setNegativeButton("Отмена", null).show()
+              }
+
+              private fun homeMenu() {
+                  val opts = arrayOf("Добавить виджет", "Обои", "Настройки", "Добавить страницу", "Удалить эту страницу")
+                  AlertDialog.Builder(this).setItems(opts) { _, i ->
+                      when (i) {
+                          0 -> pickWidget()
+                          1 -> wallpaperDialog()
+                          2 -> settingsDialog()
+                          3 -> {
+                              pageCount++
+                              prefs.edit().putInt("pages", pageCount).apply()
+                              refreshHome()
+                              pager.currentItem = pageCount - 1
+                          }
+                          4 -> removePage(pager.currentItem)
+                      }
+                  }.show()
+              }
+
+              private fun removePage(p: Int) {
+                  if (pageCount <= 1) { toast("Нельзя удалить единственную страницу"); return }
+                  for (i in items.filter { it.page == p && it.type == "widget" }) host.deleteAppWidgetId(i.ref.toInt())
+                  items.removeAll { it.page == p }
+                  items.filter { it.page > p }.forEach { it.page-- }
+                  pageCount--
+                  prefs.edit().putInt("pages", pageCount).apply()
+                  saveItems(); refreshHome()
+              }
+
+              // ================= виджеты =================
+
+              private fun pickWidget() {
+                  val provs = awm.installedProviders.sortedBy { it.loadLabel(packageManager).lowercase() }
+                  val names = provs.map { it.loadLabel(packageManager) }.toTypedArray()
+                  AlertDialog.Builder(this).setTitle("Выберите виджет").setItems(names) { _, i ->
+                      val pr = provs[i]
+                      val id = host.allocateAppWidgetId()
+                      pendingId = id
+                      if (awm.bindAppWidgetIdIfAllowed(id, pr.provider)) {
+                          afterBind(id)
+                      } else {
+                          val bind = Intent(AppWidgetManager.ACTION_APPWIDGET_BIND)
+                              .putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id)
+                              .putExtra(AppWidgetManager.EXTRA_APPWIDGET_PROVIDER, pr.provider)
+                          startActivityForResult(bind, 88)
+                      }
+                  }.setNegativeButton("Отмена", null).show()
+              }
+
+              private fun afterBind(id: Int) {
+                  val cfg = awm.getAppWidgetInfo(id)?.configure
+                  if (cfg != null) {
+                      try {
+                          val c = Intent(AppWidgetManager.ACTION_APPWIDGET_CONFIGURE)
+                              .setComponent(cfg).putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id)
+                          startActivityForResult(c, 89)
+                      } catch (e: Throwable) { addWidget(id) }
+                  } else addWidget(id)
+              }
+
+              private fun addWidget(id: Int) {
+                  val info = awm.getAppWidgetInfo(id)
+                  if (info == null) { host.deleteAppWidgetId(id); return }
+                  val dm = resources.displayMetrics
+                  val cellW = dm.widthPixels / C
+                  val cellH = (dm.heightPixels * 0.62f / R).toInt()
+                  val w = ceil(info.minWidth.toFloat() / cellW).toInt().coerceIn(1, C)
+                  val h = ceil(info.minHeight.toFloat() / cellH).toInt().coerceIn(1, R)
+                  if (placeNew("widget", id.toString(), w, h)) {
+                      refreshHome()
+                      pager.currentItem = items.last().page
+                  } else host.deleteAppWidgetId(id)
+              }
+
+              // ================= док и меню приложений =================
+
+              private fun buildDock() {
+                  dock.removeAllViews()
+                  val size = dp(prefs.getInt("icon", 56))
+                  for (p in dockList()) {
+                      val a = all.firstOrNull { it.pkg == p } ?: continue
+                      val cell = FrameLayout(this).apply {
+                          layoutParams = LinearLayout.LayoutParams(0, size, 1f)
+                          setOnClickListener { launch(a.pkg) }
+                          setOnLongClickListener { appMenu(a); true }
+                      }
+                      cell.addView(iconImage(a, size).apply {
+                          layoutParams = FrameLayout.LayoutParams(size, size, Gravity.CENTER)
+                      })
+                      dock.addView(cell)
+                  }
+                  dock.addView(TextView(this).apply {
+                      text = "▦"; textSize = 28f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                      layoutParams = LinearLayout.LayoutParams(0, size, 1f)
+                      setOnClickListener { openDrawer() }
+                  })
+              }
+
+              private fun appMenu(a: App) {
+                  val dockL = dockList()
+                  val inDock = a.pkg in dockL
+                  val opts = arrayOf("На рабочий стол", if (inDock) "Убрать из дока" else "В док", "Скрыть", "О приложении", "Удалить")
+                  AlertDialog.Builder(this).setTitle(a.label).setItems(opts) { _, i ->
+                      when (i) {
+                          0 -> { if (placeNew("app", a.pkg, 1, 1)) { refreshHome(); closeDrawer(); toast("Добавлено") } }
+                          1 -> if (inDock) saveDock(dockL - a.pkg)
+                               else if (dockL.size >= 4) toast("В доке максимум 4")
+                               else saveDock(dockL + a.pkg)
+                          2 -> prefs.edit().putStringSet("hidden", prefs.getStringSet("hidden", emptySet())!!.toMutableSet().apply { add(a.pkg) }).apply()
+                          3 -> startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${a.pkg}")))
+                          4 -> startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${a.pkg}")))
+                      }
+                      buildDock(); applyFilter()
+                  }.show()
+              }
+
+              private fun openDrawer() { search.setText(""); drawer.visibility = View.VISIBLE; windowBlur(true) }
+              private fun closeDrawer() { drawer.visibility = View.GONE; windowBlur(false) }
+
+              // ================= стекло =================
+
+              private fun glassFile() = File(filesDir, "glass.jpg")
+
+              private fun saveJpeg(bmp: Bitmap, name: String) {
+                  try { File(filesDir, name).outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) } } catch (e: Throwable) { }
+              }
+
+              private fun startLock(on: Boolean) {
+                  val i = Intent(this, LockService::class.java)
+                  try { if (on) startForegroundService(i) else stopService(i) } catch (e: Throwable) { }
+              }
+
+              private fun loadGlass() {
+                  glassBmp = try {
+                      if (glassFile().exists()) BitmapFactory.decodeFile(glassFile().path) else null
+                  } catch (e: Throwable) { null }
+              }
+
+              private fun saveGlass(src: Bitmap, name: String = "glass.jpg") {
+                  try {
+                      var cur = src
+                      val w = src.width
+                      val h = src.height
+                      while (cur.width > w / 24) {
+                          cur = Bitmap.createScaledBitmap(cur, maxOf(1, cur.width / 2), maxOf(1, cur.height / 2), true)
+                      }
+                      while (cur.width < w) {
+                          cur = Bitmap.createScaledBitmap(cur, minOf(w, cur.width * 2), minOf(h, cur.height * 2), true)
+                      }
+                      File(filesDir, name).outputStream().use { cur.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+                  } catch (e: Throwable) { }
+              }
+
+              private fun applyGlass() {
+                  val a = prefs.getInt("glass", 45)
+                  val tint = Color.argb(a, 255, 255, 255)
+                  dock.background = GlassDrawable(dock, dp(28).toFloat(), glassBmp, tint)
+                  search.background = GlassDrawable(search, dp(24).toFloat(), glassBmp, tint)
+                  drawer.background = if (glassBmp != null)
+                      GlassDrawable(drawer, 0f, glassBmp, Color.argb(120, 0, 0, 0))
+                  else ColorDrawable(Color.argb(225, 0, 0, 0))
+              }
+
+              private fun windowBlur(on: Boolean) {
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      try { window.setBackgroundBlurRadius(if (on && prefs.getBoolean("wblur", true)) dp(24) else 0) } catch (e: Throwable) { }
+                  }
+              }
+
+              // ================= настройки и обои =================
+
+              private fun applySettings() {
+                  grid.numColumns = prefs.getInt("cols", 4)
+                  root.setBackgroundColor(Color.argb(prefs.getInt("dim", 0), 0, 0, 0))
+                  adapter.notifyDataSetChanged()
+                  buildDock()
+                  applyGlass()
+                  val rm = prefs.getBoolean("realme", false)
+                  clockHolder.removeAllViews()
+                  if (rm) {
+                      clockHolder.addView(
+                          GlassClockView(this, false, false, prefs.getBoolean("lk_24", true), prefs.getBoolean("hclock_light", false)),
+                          FrameLayout.LayoutParams(dp(190), dp(104), Gravity.CENTER_HORIZONTAL)
+                      )
+                  }
+                  askPill.visibility = if (rm) View.VISIBLE else View.GONE
+                  refreshHome()
+              }
+
+              private fun settingsDialog() {
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(10), dp(20), 0) }
+                  fun label(t: String) = TextView(this@MainActivity).apply { text = t; setPadding(0, dp(14), 0, dp(2)) }
+                  val colsOpts = listOf(3, 4, 5, 6)
+                  val cols = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, colsOpts.map { "$it" })
+                      setSelection(colsOpts.indexOf(prefs.getInt("cols", 4)).coerceAtLeast(0))
+                  }
+                  val icon = SeekBar(this).apply { max = 40; progress = prefs.getInt("icon", 56) - 40 }
+                  val labels = CheckBox(this).apply { text = "Показывать подписи"; isChecked = prefs.getBoolean("labels", true) }
+                  val dim = SeekBar(this).apply { max = 180; progress = prefs.getInt("dim", 0) }
+                  val glassBar = SeekBar(this).apply { max = 120; progress = prefs.getInt("glass", 45) }
+                  val realmeCb = CheckBox(this).apply {
+                      text = "Стиль «стекло» как в Realme UI (часы, иконки)"
+                      isChecked = prefs.getBoolean("realme", false)
+                  }
+                  val lightCb = CheckBox(this).apply {
+                      text = "Светлые часы на рабочем столе"
+                      isChecked = prefs.getBoolean("hclock_light", false)
+                  }
+                  val wblur = CheckBox(this).apply { text = "Размытие фона при открытии списка (Android 12+)"; isChecked = prefs.getBoolean("wblur", true) }
+                  val wp = Button(this).apply { text = "Обои"; setOnClickListener { wallpaperDialog() } }
+                  val unhide = Button(this).apply {
+                      text = "Показать скрытые приложения"
+                      setOnClickListener { prefs.edit().remove("hidden").apply(); applyFilter(); toast("Готово") }
+                  }
+                  box.addView(label("Колонок в списке приложений")); box.addView(cols)
+                  box.addView(label("Размер иконок")); box.addView(icon)
+                  box.addView(labels)
+                  box.addView(realmeCb); box.addView(lightCb)
+                  box.addView(label("Затемнение фона")); box.addView(dim)
+                  box.addView(label("Яркость стекла (панели, док, поиск)")); box.addView(glassBar)
+                  box.addView(wblur)
+                  box.addView(label(if (glassBmp == null) "Для размытия под стеклом задайте обои через «Обои»" else "Стекло подстроено под ваши обои"))
+                  val lockCb = CheckBox(this).apply {
+                      text = "Свой экран блокировки (поверх системного)"
+                      isChecked = prefs.getBoolean("lock", false)
+                  }
+                  val lockTest = Button(this).apply {
+                      text = "Посмотреть экран блокировки"
+                      setOnClickListener { startActivity(Intent(this@MainActivity, LockActivity::class.java)) }
+                  }
+                  val battery = Button(this).apply {
+                      text = "Не ограничивать батарею"
+                      setOnClickListener {
+                          try {
+                              startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                          } catch (e: Throwable) { toast("Откройте настройки батареи вручную") }
+                      }
+                  }
+                  box.addView(wp); box.addView(unhide)
+                  box.addView(label("Экран блокировки")); box.addView(lockCb)
+                  box.addView(Button(this).apply { text = "Настроить стиль экрана блокировки"; setOnClickListener { lockStyleDialog() } })
+                  box.addView(lockTest); box.addView(battery)
+                  AlertDialog.Builder(this).setTitle("Настройки").setView(ScrollView(this).apply { addView(box) })
+                      .setPositiveButton("Готово") { _, _ ->
+                          prefs.edit()
+                              .putInt("cols", colsOpts[cols.selectedItemPosition])
+                              .putInt("icon", icon.progress + 40)
+                              .putBoolean("labels", labels.isChecked)
+                              .putInt("dim", dim.progress)
+                              .putInt("glass", glassBar.progress)
+                              .putBoolean("wblur", wblur.isChecked)
+                              .putBoolean("realme", realmeCb.isChecked)
+                              .putBoolean("hclock_light", lightCb.isChecked).apply()
+                          applySettings()
+                          val on = lockCb.isChecked
+                          prefs.edit().putBoolean("lock", on).apply()
+                          if (on) {
+                              if (!Settings.canDrawOverlays(this)) {
+                                  toast("Разрешите «Поверх других приложений» для Home Launcher")
+                                  startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                              } else {
+                                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 5)
+                                  startLock(true)
+                              }
+                          } else startLock(false)
+                      }
+                      .setNegativeButton("Отмена", null).show()
+              }
+
+              private fun lockStyleDialog() {
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(10), dp(20), 0) }
+                  fun label(t: String) = TextView(this@MainActivity).apply { text = t; setPadding(0, dp(14), 0, dp(2)) }
+                  val styles = listOf("Стеклянная карточка", "Крупные часы без панели", "Компактная плашка", "Realme: цифры в ряд", "Realme: цифры столбиком")
+                  val st = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, styles)
+                      setSelection(prefs.getInt("lk_style", 0).coerceIn(0, 4))
+                  }
+                  val alpha = SeekBar(this).apply { max = 140; progress = prefs.getInt("lk_alpha", 50) }
+                  val colors = listOf(
+                      "Белый" to Color.WHITE, "Чёрный" to Color.parseColor("#111111"), "Тёплый" to Color.parseColor("#FFD9A8"),
+                      "Голубой" to Color.parseColor("#A8E6FF"), "Розовый" to Color.parseColor("#FFC1E3")
+                  )
+                  val cs = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, colors.map { it.first })
+                      setSelection(colors.indexOfFirst { it.second == prefs.getInt("lk_color", Color.WHITE) }.coerceAtLeast(0))
+                  }
+                  val size = SeekBar(this).apply { max = 80; progress = prefs.getInt("lk_size", 80) - 40 }
+                  val dim = SeekBar(this).apply { max = 160; progress = prefs.getInt("lk_dim", 60) }
+                  val cbDate = CheckBox(this).apply { text = "Показывать дату"; isChecked = prefs.getBoolean("lk_date", true) }
+                  val cb24 = CheckBox(this).apply { text = "24-часовой формат"; isChecked = prefs.getBoolean("lk_24", true) }
+                  val cbBatt = CheckBox(this).apply { text = "Показывать заряд батареи"; isChecked = prefs.getBoolean("lk_batt", true) }
+                  val cbHint = CheckBox(this).apply { text = "Подсказка «Проведите вверх»"; isChecked = prefs.getBoolean("lk_hint", true) }
+                  box.addView(label("Стиль часов")); box.addView(st)
+                  box.addView(label("Яркость стекла")); box.addView(alpha)
+                  box.addView(label("Цвет текста")); box.addView(cs)
+                  box.addView(label("Размер часов")); box.addView(size)
+                  box.addView(label("Затемнение обоев")); box.addView(dim)
+                  box.addView(cbDate); box.addView(cb24); box.addView(cbBatt); box.addView(cbHint)
+                  box.addView(label(if (File(filesDir, "lockglass.jpg").exists()) "Размытие под стеклом: активно"
+                      else "Для размытия задайте обои: Обои → Экран блокировки"))
+                  val save = {
+                      prefs.edit()
+                          .putInt("lk_style", st.selectedItemPosition)
+                          .putInt("lk_alpha", alpha.progress)
+                          .putInt("lk_color", colors[cs.selectedItemPosition].second)
+                          .putInt("lk_size", size.progress + 40)
+                          .putInt("lk_dim", dim.progress)
+                          .putBoolean("lk_date", cbDate.isChecked)
+                          .putBoolean("lk_24", cb24.isChecked)
+                          .putBoolean("lk_batt", cbBatt.isChecked)
+                          .putBoolean("lk_hint", cbHint.isChecked).apply()
+                  }
+                  AlertDialog.Builder(this).setTitle("Экран блокировки").setView(ScrollView(this).apply { addView(box) })
+                      .setPositiveButton("Сохранить") { _, _ -> save() }
+                      .setNeutralButton("Сохранить и посмотреть") { _, _ ->
+                          save(); startActivity(Intent(this, LockActivity::class.java))
+                      }
+                      .setNegativeButton("Отмена", null).show()
+              }
+
+              private fun wallpaperDialog() {
+                  AlertDialog.Builder(this).setTitle("Куда поставить обои")
+                      .setItems(arrayOf("Домашний экран", "Экран блокировки", "Оба экрана")) { _, i ->
+                          wallTarget = i
+                          startActivityForResult(Intent.createChooser(Intent(Intent.ACTION_GET_CONTENT).setType("image/*"), "Обои"), 77)
+                      }.show()
+              }
+
+              private fun decode(uri: Uri): Bitmap {
+                  val dm = resources.displayMetrics
+                  val tw = dm.widthPixels
+                  val th = dm.heightPixels
+                  val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  contentResolver.openInputStream(uri)!!.use { BitmapFactory.decodeStream(it, null, o) }
+                  var s = 1
+                  while (o.outWidth / (s * 2) >= tw && o.outHeight / (s * 2) >= th) s *= 2
+                  val o2 = BitmapFactory.Options().apply { inSampleSize = s }
+                  val src = contentResolver.openInputStream(uri)!!.use { BitmapFactory.decodeStream(it, null, o2) }!!
+                  val scale = maxOf(tw.toFloat() / src.width, th.toFloat() / src.height)
+                  val nw = maxOf(tw, ceil(src.width * scale).toInt())
+                  val nh = maxOf(th, ceil(src.height * scale).toInt())
+                  val scaled = Bitmap.createScaledBitmap(src, nw, nh, true)
+                  return Bitmap.createBitmap(scaled, (nw - tw) / 2, (nh - th) / 2, tw, th)
+              }
+
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (req == 88) { if (res == RESULT_OK) afterBind(pendingId) else host.deleteAppWidgetId(pendingId); return }
+                  if (req == 89) { if (res == RESULT_OK) addWidget(pendingId) else host.deleteAppWidgetId(pendingId); return }
+                  if (req == 77 && res == RESULT_OK) {
+                      val uri = data?.data ?: return
+                      toast("Устанавливаю обои…")
+                      thread {
+                          try {
+                              val flags = when (wallTarget) {
+                                  0 -> WallpaperManager.FLAG_SYSTEM
+                                  1 -> WallpaperManager.FLAG_LOCK
+                                  else -> WallpaperManager.FLAG_SYSTEM or WallpaperManager.FLAG_LOCK
+                              }
+                              val bmp = decode(uri)
+                              WallpaperManager.getInstance(this).setBitmap(bmp, null, true, flags)
+                              if (wallTarget != 1) saveGlass(bmp)
+                              if (wallTarget != 0) { saveJpeg(bmp, "lockbg.jpg"); saveGlass(bmp, "lockglass.jpg") }
+                              runOnUiThread { loadGlass(); applyGlass(); toast("Обои установлены") }
+                          } catch (e: Throwable) {
+                              runOnUiThread { toast("Ошибка: ${e.message}") }
+                          }
+                      }
+                  }
+              }
+
+              // ================= список всех приложений =================
+
+              inner class AppAdapter : BaseAdapter() {
+                  override fun getCount() = shown.size
+                  override fun getItem(i: Int) = shown[i]
+                  override fun getItemId(i: Int) = i.toLong()
+                  override fun getView(i: Int, v: View?, p: ViewGroup?): View {
+                      val a = shown[i]
+                      val v2 = iconView(a, {}, {})
+                      v2.setOnClickListener(null); v2.setOnLongClickListener(null)
+                      v2.isClickable = false; v2.isLongClickable = false
+                      v2.setPadding(dp(4), dp(10), dp(4), dp(10))
+                      return v2
+                  }
+              }
+
+              // ================= создание =================
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  prefs = getSharedPreferences("home", MODE_PRIVATE)
+                  awm = AppWidgetManager.getInstance(this)
+                  host = AppWidgetHost(this, 1024)
+                  pageCount = prefs.getInt("pages", 2)
+                  loadItems()
+
+                  root = FrameLayout(this)
+                  root.setOnApplyWindowInsetsListener { v, ins ->
+                      v.setPadding(0, ins.systemWindowInsetTop, 0, ins.systemWindowInsetBottom)
+                      ins
+                  }
+
+                  // --- главный экран ---
+                  val home = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  clockHolder = FrameLayout(this)
+                  home.addView(clockHolder, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                  pager = ViewPager(this).apply {
+                      layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+                      setPadding(dp(8), dp(8), dp(8), 0)
+                      clipToPadding = false
+                      addOnPageChangeListener(object : ViewPager.SimpleOnPageChangeListener() {
+                          override fun onPageSelected(position: Int) { updateDots() }
+                      })
+                  }
+                  pager.adapter = PagesAdapter()
+                  home.addView(pager)
+
+                  askPill = TextView(this).apply {
+                      text = "✦  Искать приложения"
+                      textSize = 14f; setTextColor(Color.parseColor("#33333A")); gravity = Gravity.CENTER
+                      setPadding(dp(22), dp(10), dp(22), dp(10))
+                      background = GradientDrawable().apply {
+                          cornerRadius = dp(24).toFloat(); setColor(Color.argb(170, 255, 255, 255)); setStroke(2, Color.argb(200, 255, 255, 255))
+                      }
+                      visibility = View.GONE
+                      setOnClickListener { openDrawer() }
+                  }
+                  home.addView(askPill, LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL
+                  ).apply { topMargin = dp(4) })
+
+                  dots = TextView(this).apply {
+                      gravity = Gravity.CENTER; setTextColor(Color.WHITE); textSize = 10f
+                      setShadowLayer(4f, 0f, 1f, Color.BLACK)
+                      setPadding(0, dp(6), 0, dp(6))
+                  }
+                  home.addView(dots)
+
+                  dock = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      setPadding(dp(8), dp(10), dp(8), dp(10))
+                      background = GradientDrawable().apply { cornerRadius = dp(28).toFloat(); setColor(Color.argb(90, 0, 0, 0)) }
+                      layoutParams = LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                      ).apply { setMargins(dp(12), dp(0), dp(12), dp(12)) }
+                  }
+                  home.addView(dock)
+                  root.addView(home, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+                  // --- список всех приложений (поверх) ---
+                  drawer = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.argb(225, 0, 0, 0))
+                      visibility = View.GONE
+                      isClickable = true
+                  }
+                  val bar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(12), dp(10), dp(12), dp(4))
+                  }
+                  search = EditText(this).apply {
+                      hint = "Поиск приложений"
+                      setHintTextColor(Color.argb(160, 255, 255, 255))
+                      setTextColor(Color.WHITE); textSize = 15f
+                      inputType = InputType.TYPE_CLASS_TEXT; setSingleLine()
+                      setPadding(dp(16), dp(10), dp(16), dp(10))
+                      background = GradientDrawable().apply { cornerRadius = dp(24).toFloat(); setColor(Color.argb(90, 255, 255, 255)) }
+                      layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                      addTextChangedListener(object : TextWatcher {
+                          override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                          override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                          override fun afterTextChanged(s: Editable?) { applyFilter() }
+                      })
+                  }
+                  bar.addView(search)
+                  bar.addView(TextView(this).apply {
+                      text = "⚙"; textSize = 26f; setTextColor(Color.WHITE)
+                      setPadding(dp(14), 0, dp(6), 0)
+                      setOnClickListener { settingsDialog() }
+                  })
+                  drawer.addView(bar)
+
+                  adapter = AppAdapter()
+                  grid = GridView(this).apply {
+                      numColumns = prefs.getInt("cols", 4)
+                      adapter = this@MainActivity.adapter
+                      layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+                      setPadding(dp(8), dp(4), dp(8), dp(4))
+                      clipToPadding = false
+                      selector = ColorDrawable(Color.TRANSPARENT)
+                      setOnItemClickListener { _, _, i, _ -> launch(shown[i].pkg); closeDrawer() }
+                      setOnItemLongClickListener { _, _, i, _ -> appMenu(shown[i]); true }
+                  }
+                  drawer.addView(grid)
+                  root.addView(drawer, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+                  setContentView(root)
+                  loadGlass()
+                  applySettings()
+                  if (prefs.getBoolean("lock", false) && Settings.canDrawOverlays(this)) startLock(true)
+              }
+
+              override fun onStart() {
+                  super.onStart()
+                  try { host.startListening() } catch (e: Throwable) { }
+              }
+
+              override fun onStop() {
+                  try { host.stopListening() } catch (e: Throwable) { }
+                  super.onStop()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  loadApps()
+              }
+
+              override fun onNewIntent(intent: Intent?) {
+                  super.onNewIntent(intent)
+                  closeDrawer()
+                  moving = null
+                  if (resizing != null) { resizing = null; refreshHome() }
+                  pager.currentItem = 0
+              }
+
+              override fun onBackPressed() {
+                  when {
+                      drawer.visibility == View.VISIBLE -> closeDrawer()
+                      moving != null -> { moving = null; toast("Перемещение отменено") }
+                      resizing != null -> { resizing = null; refreshHome() }
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/homelauncher
+          cat > app/src/main/java/com/example/homelauncher/GlassClock.kt <<'EOF_FILE'
+          package com.example.homelauncher
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.LinearGradient
+          import android.graphics.Paint
+          import android.graphics.Rect
+          import android.graphics.RectF
+          import android.graphics.Shader
+          import android.graphics.Typeface
+          import android.view.View
+          import java.text.SimpleDateFormat
+          import java.util.Calendar
+          import java.util.Date
+          import java.util.Locale
+
+          /**
+           * Крупные узкие цифры с «стеклянным» градиентом (сверху плотно, вниз растворяются), как в Realme UI.
+           * framed = true: цифры в тонкой рамке с дугой в углу и маленькой датой (экран блокировки).
+           * stacked = true: часы и минуты в два этажа.
+           */
+          class GlassClockView(
+              ctx: Context,
+              private val stacked: Boolean,
+              private val framed: Boolean,
+              private val h24: Boolean,
+              private val light: Boolean,
+              private val showDate: Boolean = true
+          ) : View(ctx) {
+
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val r = Rect()
+              private val tick = object : Runnable {
+                  override fun run() { invalidate(); postDelayed(this, 1000) }
+              }
+
+              override fun onAttachedToWindow() { super.onAttachedToWindow(); post(tick) }
+              override fun onDetachedFromWindow() { removeCallbacks(tick); super.onDetachedFromWindow() }
+
+              private fun fit(c: Canvas, text: String, left: Float, top: Float, w: Float, h: Float, maxSy: Float) {
+                  p.textSize = 100f
+                  p.getTextBounds(text, 0, text.length, r)
+                  if (r.width() <= 0 || r.height() <= 0) return
+                  val k = w / r.width()
+                  val sy = minOf(h / (r.height() * k), maxSy)
+                  val topCol = if (light) Color.argb(240, 255, 255, 255) else Color.argb(240, 60, 60, 64)
+                  val botCol = if (light) Color.argb(40, 255, 255, 255) else Color.argb(25, 60, 60, 64)
+                  p.shader = LinearGradient(0f, r.top.toFloat(), 0f, r.bottom.toFloat(), topCol, botCol, Shader.TileMode.CLAMP)
+                  c.save()
+                  c.translate(left, top + (h - r.height() * k * sy) / 2f)
+                  c.scale(k, k * sy)
+                  c.drawText(text, -r.left.toFloat(), -r.top.toFloat(), p)
+                  c.restore()
+                  p.shader = null
+              }
+
+              override fun onDraw(c: Canvas) {
+                  val d = resources.displayMetrics.density
+                  val cal = Calendar.getInstance()
+                  var h = cal.get(if (h24) Calendar.HOUR_OF_DAY else Calendar.HOUR)
+                  if (!h24 && h == 0) h = 12
+                  val mm = "%02d".format(cal.get(Calendar.MINUTE))
+                  val hh = if (framed) "%02d".format(h) else h.toString()
+                  val w = width.toFloat()
+                  val ht = height.toFloat()
+
+                  p.typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+                  p.style = Paint.Style.FILL
+
+                  if (!framed) {
+                      fit(c, "$hh:$mm", 0f, 0f, w, ht, 1.6f)
+                      return
+                  }
+
+                  // рамка
+                  val rect = RectF(2 * d, 2 * d, w - 2 * d, ht - 2 * d)
+                  p.color = Color.argb(28, 255, 255, 255)
+                  c.drawRoundRect(rect, 16 * d, 16 * d, p)
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = 2 * d
+                  p.color = Color.argb(215, 255, 255, 255)
+                  c.drawRoundRect(rect, 16 * d, 16 * d, p)
+                  p.strokeWidth = 5 * d
+                  p.strokeCap = Paint.Cap.ROUND
+                  c.drawArc(RectF(rect.right - 32 * d, rect.bottom - 32 * d, rect.right, rect.bottom), 0f, 90f, false, p)
+                  p.strokeCap = Paint.Cap.BUTT
+                  p.style = Paint.Style.FILL
+
+                  val pad = 14 * d
+                  val topPad = if (showDate) 34 * d else pad
+                  if (stacked) {
+                      val gap = 8 * d
+                      val lh = (ht - topPad - pad - gap) / 2f
+                      fit(c, hh, pad, topPad, w - 2 * pad, lh, 2.4f)
+                      fit(c, mm, pad, topPad + lh + gap, w - 2 * pad, lh, 2.4f)
+                  } else {
+                      fit(c, hh + mm, pad, topPad, w - 2 * pad, ht - topPad - pad, 2.4f)
+                  }
+
+                  if (showDate) {
+                      p.typeface = Typeface.DEFAULT
+                      p.textSize = 12 * d
+                      p.color = Color.argb(225, 255, 255, 255)
+                      c.drawText(SimpleDateFormat("d MMM, EEE", Locale.getDefault()).format(Date()), pad, 24 * d, p)
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/homelauncher
+          cat > app/src/main/java/com/example/homelauncher/LockActivity.kt <<'EOF_FILE'
+          package com.example.homelauncher
+
+          import android.app.Activity
+          import android.app.KeyguardManager
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.os.BatteryManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.FrameLayout
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.TextClock
+          import android.widget.TextView
+          import java.io.File
+
+          /** Свой экран блокировки в стиле «стекло». Настройки берутся из SharedPreferences "home" (ключи lk_*). */
+          class LockActivity : Activity() {
+
+              private var downY = 0f
+              private lateinit var root: FrameLayout
+
+              private val unlocked = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) { finish() }
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun loadBmp(name: String): Bitmap? {
+                  val f = File(filesDir, name)
+                  return try { if (f.exists()) BitmapFactory.decodeFile(f.path) else null } catch (e: Throwable) { null }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  if (Build.VERSION.SDK_INT >= 27) {
+                      setShowWhenLocked(true)
+                      setTurnScreenOn(true)
+                  } else {
+                      window.addFlags(
+                          WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                      )
+                  }
+                  window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+                  @Suppress("DEPRECATION")
+                  window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or
+                      View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                      View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                      View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+
+                  val f = IntentFilter(Intent.ACTION_USER_PRESENT)
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(unlocked, f, Context.RECEIVER_EXPORTED)
+                  else registerReceiver(unlocked, f)
+
+                  // ---- настройки оформления ----
+                  val sp = getSharedPreferences("home", MODE_PRIVATE)
+                  val style = sp.getInt("lk_style", 0)
+                  val alpha = sp.getInt("lk_alpha", 50)
+                  val textColor = sp.getInt("lk_color", Color.WHITE)
+                  val timeSize = sp.getInt("lk_size", 80).toFloat()
+                  val showDate = sp.getBoolean("lk_date", true)
+                  val h24 = sp.getBoolean("lk_24", true)
+                  val showHint = sp.getBoolean("lk_hint", true)
+                  val showBatt = sp.getBoolean("lk_batt", true)
+                  val dim = sp.getInt("lk_dim", 60)
+                  val tint = Color.argb(alpha, 255, 255, 255)
+                  val lockGlass = loadBmp("lockglass.jpg")
+                  val shadow = if (textColor == Color.WHITE || Color.luminance(textColor) > 0.5f) Color.argb(110, 0, 0, 0) else Color.TRANSPARENT
+
+                  fun glass(v: View, radiusDp: Int) {
+                      v.background = GlassDrawable(v, dp(radiusDp).toFloat(), lockGlass, tint)
+                  }
+
+                  val match = ViewGroup.LayoutParams.MATCH_PARENT
+                  val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+                  root = FrameLayout(this)
+
+                  // ---- фон ----
+                  val bg = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+                  val bmp = loadBmp("lockbg.jpg")
+                  if (bmp != null) bg.setImageBitmap(bmp) else bg.setBackgroundColor(Color.parseColor("#101018"))
+                  root.addView(bg, FrameLayout.LayoutParams(match, match))
+                  root.addView(View(this).apply { setBackgroundColor(Color.argb(dim, 0, 0, 0)) },
+                      FrameLayout.LayoutParams(match, match))
+
+                  // ---- часы и дата ----
+                  fun time(sizeSp: Float) = TextClock(this).apply {
+                      val fmt = if (h24) "HH:mm" else "h:mm"
+                      format24Hour = fmt; format12Hour = fmt
+                      textSize = sizeSp; setTextColor(textColor)
+                      typeface = Typeface.create("sans-serif-thin", Typeface.NORMAL)
+                      setShadowLayer(8f, 0f, 2f, shadow)
+                  }
+                  fun date(sizeSp: Float) = TextClock(this).apply {
+                      format24Hour = "EEEE, d MMMM"; format12Hour = "EEEE, d MMMM"
+                      textSize = sizeSp; setTextColor(textColor)
+                      setShadowLayer(6f, 0f, 1f, shadow)
+                  }
+
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      setPadding(0, dp(96), 0, 0)
+                  }
+
+                  when (style) {
+                      0 -> { // стеклянная карточка
+                          val card = LinearLayout(this).apply {
+                              orientation = LinearLayout.VERTICAL
+                              gravity = Gravity.CENTER_HORIZONTAL
+                              setPadding(dp(28), dp(22), dp(28), dp(22))
+                          }
+                          card.addView(time(timeSize))
+                          if (showDate) card.addView(date(18f))
+                          glass(card, 32)
+                          col.addView(card, LinearLayout.LayoutParams(match, wrap).apply { setMargins(dp(28), 0, dp(28), 0) })
+                      }
+                      1 -> { // крупные часы без панели
+                          col.addView(time(timeSize))
+                          if (showDate) col.addView(date(18f))
+                      }
+                      3, 4 -> { // как в Realme UI: цифры-стекло в рамке
+                          val stacked = style == 4
+                          val gv = GlassClockView(this, stacked, true, h24, true, showDate)
+                          val w = if (stacked) dp(210) else resources.displayMetrics.widthPixels - dp(56)
+                          val h = if (stacked) dp(330) else dp(190)
+                          col.addView(gv, LinearLayout.LayoutParams(w, h))
+                      }
+                      else -> { // компактная плашка
+                          val pill = LinearLayout(this).apply {
+                              orientation = LinearLayout.HORIZONTAL
+                              gravity = Gravity.CENTER_VERTICAL
+                              setPadding(dp(22), dp(10), dp(22), dp(10))
+                          }
+                          pill.addView(time(30f))
+                          if (showDate) {
+                              pill.addView(TextView(this).apply { text = "   "; textSize = 14f })
+                              pill.addView(date(15f))
+                          }
+                          glass(pill, 28)
+                          col.addView(pill, LinearLayout.LayoutParams(wrap, wrap))
+                      }
+                  }
+
+                  if (showBatt) {
+                      val pct = try {
+                          getSystemService(BatteryManager::class.java).getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                      } catch (e: Throwable) { -1 }
+                      if (pct >= 0) {
+                          val b = TextView(this).apply {
+                              text = "🔋 $pct%"; textSize = 15f; setTextColor(textColor); gravity = Gravity.CENTER
+                              setPadding(dp(20), dp(8), dp(20), dp(8))
+                          }
+                          glass(b, 22)
+                          col.addView(b, LinearLayout.LayoutParams(wrap, wrap).apply { topMargin = dp(18) })
+                      }
+                  }
+                  root.addView(col, FrameLayout.LayoutParams(match, match))
+
+                  // ---- подсказка внизу ----
+                  if (showHint) {
+                      val hint = TextView(this).apply {
+                          text = "⌃   Проведите вверх"
+                          textSize = 15f; setTextColor(textColor); gravity = Gravity.CENTER
+                          setPadding(dp(28), dp(14), dp(28), dp(14))
+                      }
+                      glass(hint, 28)
+                      root.addView(hint, FrameLayout.LayoutParams(wrap, wrap, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+                          .apply { bottomMargin = dp(64) })
+                  }
+
+                  root.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> downY = e.rawY
+                          MotionEvent.ACTION_MOVE -> root.translationY = minOf(0f, e.rawY - downY)
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                              if (downY - e.rawY > dp(140)) dismiss()
+                              else root.animate().translationY(0f).setDuration(150).start()
+                      }
+                      true
+                  }
+                  setContentView(root)
+              }
+
+              private fun dismiss() {
+                  val km = getSystemService(KeyguardManager::class.java)
+                  km.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
+                      override fun onDismissSucceeded() { finish() }
+                      override fun onDismissCancelled() { root.animate().translationY(0f).setDuration(150).start() }
+                      override fun onDismissError() { finish() }
+                  })
+              }
+
+              override fun onBackPressed() { /* назад на экране блокировки не работает */ }
+
+              override fun onDestroy() {
+                  try { unregisterReceiver(unlocked) } catch (e: Throwable) { }
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/homelauncher
+          cat > app/src/main/java/com/example/homelauncher/LockService.kt <<'EOF_FILE'
+          package com.example.homelauncher
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+
+          /** Фоновая служба: когда экран гаснет, готовит свой экран блокировки поверх системного. */
+          class LockService : Service() {
+
+              private val rcv = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) {
+                      if (i.action == Intent.ACTION_SCREEN_OFF) {
+                          val s = Intent(c, LockActivity::class.java)
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                          try { c.startActivity(s) } catch (e: Throwable) { }
+                      }
+                  }
+              }
+
+              private fun notif(): Notification {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("lock", "Экран блокировки", NotificationManager.IMPORTANCE_MIN))
+                  return Notification.Builder(this, "lock")
+                      .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
+                      .setContentTitle("Свой экран блокировки включён")
+                      .build()
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, notif(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, notif())
+                  }
+                  val f = IntentFilter(Intent.ACTION_SCREEN_OFF)
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(rcv, f, Context.RECEIVER_EXPORTED)
+                  else registerReceiver(rcv, f)
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onDestroy() {
+                  try { unregisterReceiver(rcv) } catch (e: Throwable) { }
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/homelauncher
+          cat > app/src/main/java/com/example/homelauncher/BootReceiver.kt <<'EOF_FILE'
+          package com.example.homelauncher
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.provider.Settings
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) {
+                  if (i.action == Intent.ACTION_BOOT_COMPLETED &&
+                      c.getSharedPreferences("home", Context.MODE_PRIVATE).getBoolean("lock", false) &&
+                      Settings.canDrawOverlays(c)
+                  ) {
+                      try { c.startForegroundService(Intent(c, LockService::class.java)) } catch (e: Throwable) { }
+                  }
+              }
+          }
+          EOF_FILE
+      - name: Build
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HomeLauncher-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
