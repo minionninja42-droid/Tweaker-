@@ -1,0 +1,372 @@
+name: Build Fortnite Boost Root APK
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Accept Android licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "FortniteBoostRoot"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=true
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.fnboostroot"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.fnboostroot"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <queries>
+                  <package android:name="com.epicgames.fortnite" />
+              </queries>
+              <application
+                  android:label="Fortnite Boost Root"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode|keyboard|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/fnboostroot
+          cat > app/src/main/java/com/example/fnboostroot/MainActivity.kt <<'EOF_FILE'
+          package com.example.fnboostroot
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Bundle
+          import android.view.ViewGroup
+          import android.widget.*
+          import rikka.shizuku.Shizuku
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+
+              data class Opts(
+                  val res: Int, val hz: Int, val gameMode: Boolean, val kill: Boolean,
+                  val cpu: Boolean, val gpu: Boolean, val drop: Boolean, val cfg: Boolean
+              )
+
+              private val PKG = "com.epicgames.fortnite"
+              private val FN_DIRS = "/data/data/$PKG /storage/emulated/0/Android/data/$PKG"
+
+              // ---- команды root ----
+              private val cpuSave = "for p in /sys/devices/system/cpu/cpufreq/policy*; do echo \"\$p \$(cat \$p/scaling_governor)\"; done"
+              private val cpuSet = "for p in /sys/devices/system/cpu/cpufreq/policy*; do echo performance > \$p/scaling_governor; done"
+              private val gpuList = "ls -d /sys/class/devfreq/* 2>/dev/null | grep -Ei 'mali|gpu'"
+              private val gpuSave = "for d in \$($gpuList); do [ -w \$d/governor ] && echo \"\$d \$(cat \$d/governor)\"; done"
+              private val gpuSet = "for d in \$($gpuList); do [ -w \$d/governor ] && echo performance > \$d/governor; done"
+              private val dropCaches = "sync; echo 3 > /proc/sys/vm/drop_caches"
+              private val cfgSet = "for f in \$(find $FN_DIRS -name GameUserSettings.ini 2>/dev/null); do " +
+                  "[ -f \"\$f.fnboost.bak\" ] || cp \"\$f\" \"\$f.fnboost.bak\"; " +
+                  "sed -i 's/^FrameRateLimit=.*/FrameRateLimit=60.000000/' \"\$f\"; done"
+              private val cfgRestore = "for f in \$(find $FN_DIRS -name '*.fnboost.bak' 2>/dev/null); do " +
+                  "cp \"\$f\" \"\${f%.fnboost.bak}\"; rm \"\$f\"; done"
+
+              private lateinit var prefs: SharedPreferences
+              private lateinit var status: TextView
+              @Volatile private var hasRoot = false
+
+              private val resOpts = listOf(100, 90, 80, 70, 60)
+              private val hzOpts = listOf(0, 60, 90, 120, 144)
+
+              private val permListener = Shizuku.OnRequestPermissionResultListener { _, _ ->
+                  runOnUiThread { refreshStatus() }
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
+
+              // ---------- выполнение команд ----------
+
+              private fun shizukuOk() = try {
+                  Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+              } catch (e: Throwable) { false }
+
+              private fun shizukuSh(cmd: String): String {
+                  val m = Shizuku::class.java.getDeclaredMethod(
+                      "newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java
+                  )
+                  m.isAccessible = true
+                  val p = m.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+                  val out = p.inputStream.bufferedReader().readText() + p.errorStream.bufferedReader().readText()
+                  p.waitFor()
+                  return out.trim()
+              }
+
+              private fun su(cmd: String): String {
+                  val p = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+                  val out = p.inputStream.bufferedReader().readText() + p.errorStream.bufferedReader().readText()
+                  p.waitFor()
+                  return out.trim()
+              }
+
+              private fun run(cmd: String): String = if (hasRoot) su(cmd) else shizukuSh(cmd)
+
+              private fun checkRoot() {
+                  thread {
+                      hasRoot = try { su("id").contains("uid=0") } catch (e: Throwable) { false }
+                      runOnUiThread { refreshStatus() }
+                  }
+              }
+
+              private fun refreshStatus() {
+                  val inst = packageManager.getLaunchIntentForPackage(PKG) != null
+                  status.text = "Root: " + (if (hasRoot) "есть ✓" else "нет ✗") +
+                      "\nShizuku: " + (if (shizukuOk()) "доступ есть ✓" else "нет доступа ✗") +
+                      "\nFortnite: " + (if (inst) "установлен ✓" else "не найден ✗")
+              }
+
+              private fun requestShizuku() {
+                  try {
+                      if (!Shizuku.pingBinder()) toast("Shizuku не запущен") else Shizuku.requestPermission(0)
+                  } catch (e: Throwable) { toast("Shizuku не установлен") }
+              }
+
+              // ---------- буст и сброс ----------
+
+              private fun restoreFrom(saved: String, file: String): String =
+                  saved.lines().map { it.trim() }.filter { it.contains(" ") }.joinToString("; ") {
+                      val i = it.lastIndexOf(' ')
+                      "echo ${it.substring(i + 1)} > ${it.substring(0, i)}/$file"
+                  }
+
+              private fun boostAndLaunch(o: Opts) {
+                  val intent = packageManager.getLaunchIntentForPackage(PKG)
+                  if (intent == null) {
+                      toast("Fortnite не установлен")
+                      try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=$PKG"))) } catch (e: Throwable) { }
+                      return
+                  }
+                  if (!hasRoot && !shizukuOk()) { toast("Нужен root (разрешите в Magisk) или доступ Shizuku"); return }
+                  thread {
+                      val cmds = mutableListOf<String>()
+                      try {
+                          if (o.res < 100) cmds += "S=\$(wm size | grep Physical | sed 's/.*: //'); W=\${S%x*}; H=\${S#*x}; wm size \$((W*${o.res}/100))x\$((H*${o.res}/100))"
+                          if (o.hz > 0) cmds += "settings put system min_refresh_rate ${o.hz}; settings put system peak_refresh_rate ${o.hz}"
+                          if (o.gameMode) cmds += "cmd game mode performance $PKG"
+                          if (o.kill) cmds += "am kill-all"
+                          if (hasRoot) {
+                              if (o.cpu) {
+                                  prefs.edit().putString("cpu_saved", su(cpuSave)).apply()
+                                  cmds += cpuSet
+                              }
+                              if (o.gpu) {
+                                  prefs.edit().putString("gpu_saved", su(gpuSave)).apply()
+                                  cmds += gpuSet
+                              }
+                              if (o.drop) cmds += dropCaches
+                              if (o.cfg) cmds += cfgSet
+                          }
+                          if (cmds.isNotEmpty()) run(cmds.joinToString("; "))
+                      } catch (e: Throwable) { }
+                      prefs.edit().putLong("boosted_at", System.currentTimeMillis()).apply()
+                      Thread.sleep(500)
+                      runOnUiThread { startActivity(intent) }
+                  }
+              }
+
+              private fun reset() {
+                  if (!hasRoot && !shizukuOk()) { toast("Нет root и доступа Shizuku"); return }
+                  thread {
+                      val cmds = mutableListOf(
+                          "settings delete system min_refresh_rate", "settings delete system peak_refresh_rate",
+                          "wm size reset", "wm density reset", "cmd game mode standard $PKG"
+                      )
+                      if (hasRoot) {
+                          val cpu = prefs.getString("cpu_saved", "") ?: ""
+                          val gpu = prefs.getString("gpu_saved", "") ?: ""
+                          if (cpu.isNotEmpty()) cmds += restoreFrom(cpu, "scaling_governor")
+                          if (gpu.isNotEmpty()) cmds += restoreFrom(gpu, "governor")
+                          cmds += cfgRestore
+                      }
+                      try { run(cmds.filter { it.isNotEmpty() }.joinToString("; ")) } catch (e: Throwable) { }
+                      prefs.edit().putLong("boosted_at", 0L).remove("cpu_saved").remove("gpu_saved").apply()
+                      runOnUiThread { toast("Всё возвращено как было") }
+                  }
+              }
+
+              // ---------- интерфейс ----------
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  prefs = getSharedPreferences("fnroot", MODE_PRIVATE)
+                  try { Shizuku.addRequestPermissionResultListener(permListener) } catch (e: Throwable) { }
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(18), dp(40), dp(18), dp(14))
+                      background = GradientDrawable(
+                          GradientDrawable.Orientation.TOP_BOTTOM,
+                          intArrayOf(Color.parseColor("#0E1224"), Color.parseColor("#1F2A52"))
+                      )
+                  }
+                  root.addView(TextView(this).apply {
+                      text = "Fortnite Boost Root"; textSize = 24f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD
+                  })
+                  status = TextView(this).apply {
+                      textSize = 13f; setTextColor(Color.argb(210, 255, 255, 255)); setPadding(0, dp(6), 0, dp(8))
+                  }
+                  root.addView(status)
+                  root.addView(Button(this).apply { text = "Доступ Shizuku (если нет root)"; setOnClickListener { requestShizuku() } })
+
+                  fun card() = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(10), dp(16), dp(12))
+                      background = GradientDrawable().apply {
+                          cornerRadius = dp(18).toFloat()
+                          setColor(Color.argb(30, 255, 255, 255))
+                          setStroke(dp(1), Color.argb(60, 255, 255, 255))
+                      }
+                      layoutParams = LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                      ).apply { topMargin = dp(10) }
+                  }
+                  fun label(t: String) = TextView(this).apply { text = t; setTextColor(Color.WHITE); setPadding(0, dp(8), 0, dp(2)) }
+                  fun check(t: String, key: String, def: Boolean) = CheckBox(this).apply {
+                      text = t; setTextColor(Color.WHITE); isChecked = prefs.getBoolean(key, def)
+                  }
+
+                  val c1 = card()
+                  val resSp = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, resOpts.map { "$it%" })
+                      setSelection(resOpts.indexOf(prefs.getInt("res", 80)).coerceAtLeast(0))
+                  }
+                  val hzSp = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                          hzOpts.map { if (it == 0) "Авто" else "$it Гц" })
+                      setSelection(hzOpts.indexOf(prefs.getInt("hz", 60)).coerceAtLeast(0))
+                  }
+                  val gm = check("Режим производительности (Android 12+)", "gm", true)
+                  val kill = check("Очистить фоновые приложения", "kill", true)
+                  c1.addView(label("Разрешение экрана (меньше — выше FPS)")); c1.addView(resSp)
+                  c1.addView(label("Частота экрана")); c1.addView(hzSp)
+                  c1.addView(gm); c1.addView(kill)
+                  root.addView(c1)
+
+                  val c2 = card()
+                  c2.addView(TextView(this).apply {
+                      text = "Только с root"; textSize = 15f; setTextColor(Color.parseColor("#FFD27A")); typeface = Typeface.DEFAULT_BOLD
+                  })
+                  val cpu = check("Процессор: режим performance", "cpu", true)
+                  val gpu = check("Видеочип: режим performance", "gpu", true)
+                  val drop = check("Сбросить кэш памяти", "drop", true)
+                  val cfg = check("Fortnite: правка конфига FPS (экспериментально)", "cfg", false)
+                  c2.addView(cpu); c2.addView(gpu); c2.addView(drop); c2.addView(cfg)
+                  c2.addView(TextView(this).apply {
+                      text = "Максимальные режимы сильнее греют телефон и быстрее садят батарею. После игры нажмите «Сбросить»."
+                      textSize = 11f; setTextColor(Color.argb(160, 255, 255, 255))
+                  })
+                  root.addView(c2)
+
+                  root.addView(Button(this).apply {
+                      text = "▶  Запустить Fortnite с бустом"; textSize = 16f
+                      layoutParams = LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                      ).apply { topMargin = dp(12) }
+                      setOnClickListener {
+                          val o = Opts(
+                              resOpts[resSp.selectedItemPosition], hzOpts[hzSp.selectedItemPosition],
+                              gm.isChecked, kill.isChecked, cpu.isChecked, gpu.isChecked, drop.isChecked, cfg.isChecked
+                          )
+                          prefs.edit().putInt("res", o.res).putInt("hz", o.hz).putBoolean("gm", o.gameMode)
+                              .putBoolean("kill", o.kill).putBoolean("cpu", o.cpu).putBoolean("gpu", o.gpu)
+                              .putBoolean("drop", o.drop).putBoolean("cfg", o.cfg).apply()
+                          boostAndLaunch(o)
+                      }
+                  })
+                  root.addView(Button(this).apply { text = "Сбросить всё"; setOnClickListener { reset() } })
+                  root.addView(TextView(this).apply {
+                      text = "Приложение не снимает лимит кадров игры: максимум FPS в Fortnite зависит от поддержки вашего телефона."
+                      textSize = 11f; setTextColor(Color.argb(140, 255, 255, 255)); setPadding(0, dp(8), 0, 0)
+                  })
+                  setContentView(ScrollView(this).apply { addView(root) })
+                  refreshStatus()
+                  checkRoot()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refreshStatus()
+                  val t = prefs.getLong("boosted_at", 0L)
+                  if (t > 0L && System.currentTimeMillis() - t > 20_000L && (hasRoot || shizukuOk())) reset()
+              }
+
+              override fun onDestroy() {
+                  try { Shizuku.removeRequestPermissionResultListener(permListener) } catch (e: Throwable) { }
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+      - name: Build
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FortniteBoostRoot-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
