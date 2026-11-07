@@ -1,0 +1,669 @@
+name: Build Aether Launcher APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$(find "$SDK/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort | tail -n 1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses >/dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK" --install "platforms;android-35"
+          "$SDKMANAGER" --sdk_root="$SDK" --install "build-tools;35.0.0"
+          "$SDKMANAGER" --sdk_root="$SDK" --install "platform-tools"
+
+      - name: Generate Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/java/com/aether/launcher
+          mkdir -p app/src/main/res/drawable
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AetherLauncher"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          org.gradle.parallel=true
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.aether.launcher"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.aether.launcher"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 2
+                  versionName = "2.0.0"
+              }
+              buildFeatures { compose = true }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.12.01"))
+              implementation("androidx.activity:activity-compose:1.10.0")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+              debugImplementation("androidx.compose.ui:ui-tooling")
+          }
+          EOF
+
+          cat > app/src/main/res/drawable/ic_aether.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#171923" android:pathData="M0,0h108v108h-108z"/>
+              <path android:fillColor="#B9A7FF" android:pathData="M54,13C31,13 17,34 17,55c0,21 16,40 37,40s37,-19 37,-40C91,34 77,13 54,13zM54,27c14,0 23,13 23,28S68,81 54,81 31,70 31,55 40,27 54,27z"/>
+              <path android:fillColor="#FFFFFF" android:pathData="M54,35L65,58L54,76L43,58z"/>
+          </vector>
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+              <application
+                  android:allowBackup="true"
+                  android:label="Aether Launcher"
+                  android:icon="@drawable/ic_aether"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:supportsRtl="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="unspecified">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/aether/launcher/MainActivity.kt <<'EOF'
+          package com.aether.launcher
+
+          import android.content.Intent
+          import android.os.Bundle
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.animation.core.FastOutSlowInEasing
+          import androidx.compose.animation.core.RepeatMode
+          import androidx.compose.animation.core.animateFloat
+          import androidx.compose.animation.core.infiniteRepeatable
+          import androidx.compose.animation.core.rememberInfiniteTransition
+          import androidx.compose.animation.core.tween
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gestures.detectDragGestures
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.grid.GridCells
+          import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+          import androidx.compose.foundation.lazy.grid.items
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.BasicTextField
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.blur
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.unit.IntOffset
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.delay
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import kotlin.math.roundToInt
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.statusBarColor = android.graphics.Color.TRANSPARENT
+                  window.navigationBarColor = android.graphics.Color.TRANSPARENT
+                  window.decorView.systemUiVisibility =
+                      android.view.View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                      android.view.View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                      android.view.View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                  setContent { AetherApp() }
+              }
+          }
+
+          private data class AppEntry(val title: String, val packageName: String, val icon: android.graphics.drawable.Drawable)
+
+          @Composable
+          private fun AetherApp() {
+              val context = LocalContext.current
+              var screen by remember { mutableStateOf("home") }
+              var page by remember { mutableIntStateOf(0) }
+              var search by remember { mutableStateOf("") }
+              var dark by remember { mutableStateOf(true) }
+              var accentIndex by remember { mutableIntStateOf(0) }
+              var widgetVisible by remember { mutableStateOf(true) }
+              var widgetScale by remember { mutableFloatStateOf(1f) }
+              var widgetX by remember { mutableFloatStateOf(0f) }
+              var widgetY by remember { mutableFloatStateOf(0f) }
+              var lockStyle by remember { mutableIntStateOf(0) }
+              var showWidgetTools by remember { mutableStateOf(false) }
+              val accents = listOf(Color(0xFFBBA8FF), Color(0xFF8BE0D0), Color(0xFFFFB8CC), Color(0xFFFFD28A), Color(0xFF91C7FF))
+              val accent = accents[accentIndex]
+              val bg = if (dark) Color(0xFF0D0F17) else Color(0xFFF2F1F8)
+              val fg = if (dark) Color(0xFFF8F6FF) else Color(0xFF171722)
+              val muted = if (dark) Color(0xFFB4B2C1) else Color(0xFF666575)
+              val glass = if (dark) Color(0xAA242633) else Color(0xCCFFFFFF)
+              val apps = remember {
+                  context.packageManager.queryIntentActivities(
+                      Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
+                  ).map {
+                      AppEntry(it.loadLabel(context.packageManager).toString(), it.activityInfo.packageName, it.loadIcon(context.packageManager))
+                  }.distinctBy { it.packageName }.sortedBy { it.title.lowercase(Locale.getDefault()) }
+              }
+              val filteredApps = apps.filter { it.title.contains(search, ignoreCase = true) }
+
+              MaterialTheme(colorScheme = if (dark) darkColorScheme(primary = accent, background = bg, surface = glass)
+                  else lightColorScheme(primary = accent, background = bg, surface = glass)) {
+                  Box(Modifier.fillMaxSize().background(bg)) {
+                      AnimatedBackdrop()
+                      when (screen) {
+                          "lock" -> LockScreen(accent, fg, muted, lockStyle) { screen = "home" }
+                          "apps" -> AppDrawer(filteredApps, search, { search = it }, fg, muted, glass, accent) { pkg ->
+                              context.packageManager.getLaunchIntentForPackage(pkg)?.let(context::startActivity)
+                          }
+                          "themes" -> ThemesScreen(accents, accentIndex, { accentIndex = it }, dark, { dark = it }, fg, muted, glass)
+                          "settings" -> SettingsScreen(dark, { dark = it }, widgetVisible, { widgetVisible = it },
+                              lockStyle, { lockStyle = it }, fg, muted, glass, accent) {
+                              runCatching { context.startActivity(Intent(Intent.ACTION_SET_WALLPAPER)) }
+                          }
+                          "widgets" -> WidgetStudio(widgetVisible, { widgetVisible = it }, widgetScale, { widgetScale = it },
+                              fg, muted, glass, accent)
+                          else -> HomeScreen(
+                              page, { page = it }, apps.take(8), fg, muted, glass, accent,
+                              widgetVisible, widgetScale, widgetX, widgetY,
+                              { widgetX = it }, { widgetY = it }, { showWidgetTools = !showWidgetTools },
+                              showWidgetTools, { screen = it }, { screen = "apps" }
+                          )
+                      }
+                      if (screen != "home" && screen != "lock") {
+                          TextButton(onClick = { screen = "home" }, modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp)) {
+                              Text("← На рабочий стол", color = accent)
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun AnimatedBackdrop() {
+              val transition = rememberInfiniteTransition(label = "wallpaper")
+              val shift by transition.animateFloat(
+                  initialValue = 0f, targetValue = 1f,
+                  animationSpec = infiniteRepeatable(tween(9000, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+                  label = "gradient"
+              )
+              Box(Modifier.fillMaxSize()) {
+                  Box(Modifier.offset(x = (-90 + shift * 70).dp, y = 90.dp).size(280.dp).blur(75.dp)
+                      .background(Color(0x665C4C9D), CircleShape))
+                  Box(Modifier.align(Alignment.BottomEnd).offset(x = 80.dp, y = (-90 + shift * 50).dp)
+                      .size(300.dp).blur(80.dp).background(Color(0x55417F89), CircleShape))
+              }
+          }
+
+          @Composable
+          private fun HomeScreen(
+              page: Int, setPage: (Int) -> Unit, apps: List<AppEntry>, fg: Color, muted: Color,
+              glass: Color, accent: Color, widgetVisible: Boolean, widgetScale: Float,
+              widgetX: Float, widgetY: Float, setWidgetX: (Float) -> Unit, setWidgetY: (Float) -> Unit,
+              onWidgetTools: () -> Unit, showWidgetTools: Boolean, open: (String) -> Unit, openApps: () -> Unit
+          ) {
+              val context = LocalContext.current
+              var time by remember { mutableStateOf("--:--") }
+              LaunchedEffect(Unit) {
+                  while (true) {
+                      time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+                      delay(1000)
+                  }
+              }
+              var swipeDistance by remember { mutableFloatStateOf(0f) }
+              Column(Modifier.fillMaxSize().pointerInput(page) {
+                  detectDragGestures(
+                      onDragStart = { swipeDistance = 0f },
+                      onDragEnd = {
+                          if (swipeDistance < -85f) setPage((page + 1).coerceAtMost(2))
+                          if (swipeDistance > 85f) setPage((page - 1).coerceAtLeast(0))
+                      }
+                  ) { change, amount ->
+                      swipeDistance += amount.x
+                      change.consume()
+                  }
+              }.padding(start = 20.dp, end = 20.dp, top = 48.dp, bottom = 14.dp)) {
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                      Column {
+                          Text("ВОСКРЕСЕНЬЕ  ·  AETHER", color = muted, fontSize = 10.sp, letterSpacing = 2.sp, fontWeight = FontWeight.Bold)
+                          Text(time, color = fg, fontSize = 38.sp, fontWeight = FontWeight.Light)
+                      }
+                      GlassButton("◉") { open("lock") }
+                  }
+                  Spacer(Modifier.height(14.dp))
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                      Text("Рабочий стол", color = fg, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                      Text("Страница ${page + 1}/3", color = muted, fontSize = 12.sp)
+                  }
+                  Spacer(Modifier.height(18.dp))
+                  if (page == 0) {
+                      if (widgetVisible) {
+                          Card(
+                              modifier = Modifier.fillMaxWidth().offset { IntOffset(widgetX.roundToInt(), widgetY.roundToInt()) }
+                                  .pointerInput(Unit) {
+                                      detectDragGestures { change, drag ->
+                                          change.consume()
+                                          setWidgetX((widgetX + drag.x).coerceIn(-80f, 80f))
+                                          setWidgetY((widgetY + drag.y).coerceIn(-100f, 100f))
+                                      }
+                                  }.clickable { onWidgetTools() },
+                              shape = RoundedCornerShape(28.dp),
+                              colors = CardDefaults.cardColors(containerColor = glass)
+                          ) {
+                              Column(Modifier.fillMaxWidth().padding(18.dp)) {
+                                  Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Text("ПОГОДА  ·  ВИДЖЕТ", color = muted, fontSize = 10.sp, letterSpacing = 1.5.sp)
+                                      Spacer(Modifier.weight(1f))
+                                      Text("⋯", color = accent, fontSize = 22.sp)
+                                  }
+                                  Spacer(Modifier.height(8.dp))
+                                  Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Text("☀  24°", color = fg, fontSize = (32 * widgetScale).sp, fontWeight = FontWeight.Light)
+                                      Spacer(Modifier.weight(1f))
+                                      Column(horizontalAlignment = Alignment.End) {
+                                          Text("Ясно", color = fg, fontSize = 15.sp)
+                                          Text("Хороший день", color = muted, fontSize = 11.sp)
+                                      }
+                                  }
+                                  if (showWidgetTools) {
+                                      Text("Открой раздел «Виджеты», чтобы изменить размер карточки", color = muted, fontSize = 10.sp)
+                                  }
+                              }
+                          }
+                          Spacer(Modifier.height(10.dp))
+                          Text("Нажми на карточку для настроек · перетаскивай для перемещения", color = muted, fontSize = 10.sp)
+                      }
+                      Spacer(Modifier.height(16.dp))
+                      Text("Избранное", color = fg, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                      Spacer(Modifier.height(10.dp))
+                      AppGrid(apps.take(8), fg, accent) { pkg ->
+                          context.packageManager.getLaunchIntentForPackage(pkg)?.let(context::startActivity)
+                      }
+                  } else if (page == 1) {
+                      Text("Твои приложения", color = muted, fontSize = 13.sp)
+                      Spacer(Modifier.height(12.dp))
+                      GlassSearch("Найти приложение", "", {}, fg, muted, glass) { openApps() }
+                      Spacer(Modifier.height(16.dp))
+                      AppGrid(apps, fg, accent) { pkg -> context.packageManager.getLaunchIntentForPackage(pkg)?.let(context::startActivity) }
+                  } else {
+                      Text("Персонализация", color = muted, fontSize = 13.sp)
+                      Spacer(Modifier.height(14.dp))
+                      FeatureTile("✦", "Темы и оформление", "Цвета, glass и стиль", glass, fg, muted, accent) { open("themes") }
+                      FeatureTile("▦", "Виджеты", "Добавление и размеры", glass, fg, muted, accent) { open("widgets") }
+                      FeatureTile("◉", "Экран блокировки", "Часы и стили", glass, fg, muted, accent) { open("lock") }
+                      FeatureTile("⚙", "Настройки", "Поведение лаунчера", glass, fg, muted, accent) { open("settings") }
+                      FeatureTile("▧", "Обои", "Системный выбор обоев", glass, fg, muted, accent) {
+                          runCatching { context.startActivity(Intent(Intent.ACTION_SET_WALLPAPER)) }
+                      }
+                  }
+                  Spacer(Modifier.weight(1f))
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                      repeat(3) { index ->
+                          Box(Modifier.padding(4.dp).size(if (page == index) 18.dp else 6.dp, 6.dp)
+                              .clip(CircleShape).background(if (page == index) accent else muted.copy(alpha = .5f))
+                              .clickable { setPage(index) })
+                      }
+                  }
+                  Spacer(Modifier.height(12.dp))
+                  Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(28.dp)).background(glass).padding(horizontal = 10.dp, vertical = 10.dp),
+                      horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+                      DockItem("☎", "Телефон", fg) { LaunchByIntent(context, Intent(Intent.ACTION_DIAL)) }
+                      DockItem("◎", "Камера", fg) { LaunchByIntent(context, Intent("android.media.action.IMAGE_CAPTURE")) }
+                      DockItem("⌕", "Поиск", fg, openApps)
+                      DockItem("▦", "Все", fg, openApps)
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                      Text("Проводи влево или вправо для смены страниц", color = muted.copy(alpha = .7f), fontSize = 9.sp)
+                  }
+              }
+           }
+
+          @Composable
+          private fun AppGrid(apps: List<AppEntry>, fg: Color, accent: Color, launch: (String) -> Unit) {
+              LazyVerticalGrid(columns = GridCells.Fixed(4), modifier = Modifier.fillMaxWidth().heightIn(max = 360.dp),
+                  verticalArrangement = Arrangement.spacedBy(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                  items(apps) { app ->
+                      Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable { launch(app.packageName) }.padding(3.dp)) {
+                          Box(Modifier.size(52.dp).clip(RoundedCornerShape(17.dp)).background(Color.White.copy(alpha = .12f)),
+                              contentAlignment = Alignment.Center) {
+                              AppIcon(app.icon, app.title)
+                          }
+                          Spacer(Modifier.height(5.dp))
+                          Text(app.title, color = fg, fontSize = 10.sp, maxLines = 1, textAlign = TextAlign.Center)
+                      }
+                  }
+              }
+          }
+
+
+          @Composable
+          private fun AppIcon(drawable: android.graphics.drawable.Drawable, label: String) {
+              val bitmap = remember(drawable) {
+                  val width = 96
+                  val height = 96
+                  val image = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                  val canvas = Canvas(image)
+                  drawable.setBounds(0, 0, width, height)
+                  drawable.draw(canvas)
+                  image.asImageBitmap()
+              }
+              androidx.compose.foundation.Image(bitmap = bitmap, contentDescription = label, modifier = Modifier.size(42.dp))
+          }
+
+          @Composable
+          private fun AppDrawer(apps: List<AppEntry>, search: String, onSearch: (String) -> Unit,
+              fg: Color, muted: Color, glass: Color, accent: Color, launch: (String) -> Unit) {
+              Column(Modifier.fillMaxSize().padding(start = 20.dp, end = 20.dp, top = 52.dp, bottom = 70.dp)) {
+                  Text("Приложения", color = fg, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+                  Spacer(Modifier.height(16.dp))
+                  GlassSearch("Поиск приложения…", search, onSearch, fg, muted, glass)
+                  Spacer(Modifier.height(16.dp))
+                  if (apps.isEmpty()) Text("Ничего не найдено", color = muted)
+                  else AppGrid(apps, fg, accent, launch)
+              }
+          }
+
+          @Composable
+          private fun GlassSearch(hint: String, value: String, onValue: (String) -> Unit,
+              fg: Color, muted: Color, glass: Color, onClick: (() -> Unit)? = null) {
+              Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(glass).clickable(enabled = onClick != null) { onClick?.invoke() }.padding(15.dp),
+                  verticalAlignment = Alignment.CenterVertically) {
+                  Text("⌕", color = muted, fontSize = 20.sp)
+                  Spacer(Modifier.width(10.dp))
+                  BasicTextField(value, onValue, modifier = Modifier.weight(1f), singleLine = true,
+                      textStyle = TextStyle(color = fg, fontSize = 14.sp), decorationBox = { inner ->
+                          if (value.isEmpty()) Text(hint, color = muted, fontSize = 14.sp)
+                          inner()
+                      })
+              }
+          }
+
+          @Composable
+          private fun LockScreen(accent: Color, fg: Color, muted: Color, style: Int, unlock: () -> Unit) {
+              val context = LocalContext.current
+              var time by remember { mutableStateOf("09:41") }
+              LaunchedEffect(Unit) {
+                  while (true) {
+                      time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+                      delay(1000)
+                  }
+              }
+              Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF222A4A), Color(0xFF10131F), Color(0xFF07090F))))) {
+                  Box(Modifier.align(Alignment.TopEnd).offset(x = 80.dp, y = 120.dp).size(270.dp).blur(55.dp).background(accent.copy(alpha = .42f), CircleShape))
+                  Box(Modifier.align(Alignment.BottomStart).offset(x = (-70).dp, y = (-90).dp).size(250.dp).blur(60.dp).background(Color(0x6645A9A0), CircleShape))
+                  Column(Modifier.fillMaxSize().padding(26.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                      Spacer(Modifier.height(56.dp))
+                      Text("ПОНЕДЕЛЬНИК, 8 ИЮНЯ", color = Color.White.copy(alpha = .75f), fontSize = 12.sp, letterSpacing = 2.sp)
+                      Spacer(Modifier.height(12.dp))
+                      Text(time, color = Color.White, fontSize = if (style == 1) 82.sp else 96.sp, fontWeight = FontWeight.ExtraLight)
+                      Text(if (style == 2) "AETHER  ·  NOTHING STYLE" else "Облачно · 24°", color = Color.White.copy(alpha = .8f), fontSize = 14.sp)
+                      Spacer(Modifier.weight(1f))
+                      Card(colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = .13f)),
+                          shape = RoundedCornerShape(28.dp)) {
+                          Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                              Column(Modifier.weight(1f)) {
+                                  Text("Уведомления", color = Color.White, fontWeight = FontWeight.SemiBold)
+                                  Text("Здесь будут отображаться уведомления устройства", color = Color.White.copy(alpha = .7f), fontSize = 11.sp)
+                              }
+                              Text("◌", color = accent, fontSize = 24.sp)
+                          }
+                      }
+                      Spacer(Modifier.height(30.dp))
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                          GlassButton("◉") { runCatching { context.startActivity(Intent("android.media.action.STILL_IMAGE_CAMERA")) } }
+                          GlassButton("⌁") { runCatching { context.startActivity(Intent(Settings.ACTION_SETTINGS)) } }
+                      }
+                      Spacer(Modifier.height(22.dp))
+                      Text("Проведи вверх, чтобы вернуться", color = Color.White.copy(alpha = .75f), fontSize = 12.sp,
+                          modifier = Modifier.clickable { unlock() })
+                      Spacer(Modifier.height(12.dp))
+                      Box(Modifier.width(110.dp).height(5.dp).clip(CircleShape).background(Color.White.copy(alpha = .8f)).clickable { unlock() })
+                  }
+              }
+          }
+
+          @Composable
+          private fun ThemesScreen(accents: List<Color>, selected: Int, choose: (Int) -> Unit,
+              dark: Boolean, setDark: (Boolean) -> Unit, fg: Color, muted: Color, glass: Color) {
+              Column(Modifier.fillMaxSize().padding(22.dp)) {
+                  Text("Темы", color = fg, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+                  Text("Собери свой стиль Aether", color = muted)
+                  Spacer(Modifier.height(26.dp))
+                  Text("Акцентный цвет", color = fg, fontWeight = FontWeight.SemiBold)
+                  Spacer(Modifier.height(14.dp))
+                  Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                      accents.forEachIndexed { i, c ->
+                          Box(Modifier.size(46.dp).clip(CircleShape).background(c).clickable { choose(i) },
+                              contentAlignment = Alignment.Center) { if (selected == i) Text("✓", color = Color.Black, fontWeight = FontWeight.Bold) }
+                      }
+                  }
+                  Spacer(Modifier.height(24.dp))
+                  Card(colors = CardDefaults.cardColors(containerColor = glass)) {
+                      Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                          Text("Тёмная тема", color = fg, modifier = Modifier.weight(1f))
+                          Switch(dark, setDark)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun SettingsScreen(dark: Boolean, setDark: (Boolean) -> Unit, widget: Boolean, setWidget: (Boolean) -> Unit,
+              lockStyle: Int, setLockStyle: (Int) -> Unit, fg: Color, muted: Color, glass: Color, accent: Color,
+              chooseWallpaper: () -> Unit) {
+              Column(Modifier.fillMaxSize().padding(22.dp)) {
+                  Text("Настройки", color = fg, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+                  Spacer(Modifier.height(18.dp))
+                  ToggleRow("Тёмное оформление", dark, setDark, glass, fg)
+                  ToggleRow("Показывать виджет погоды", widget, setWidget, glass, fg)
+                  Spacer(Modifier.height(16.dp))
+                  Text("Стиль экрана блокировки", color = muted)
+                  listOf("Glass iOS", "Minimal", "Nothing dots").forEachIndexed { i, title ->
+                      Row(Modifier.fillMaxWidth().padding(vertical = 5.dp).clip(RoundedCornerShape(16.dp)).background(glass)
+                          .clickable { setLockStyle(i) }.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                          Text(title, color = fg, modifier = Modifier.weight(1f))
+                          if (lockStyle == i) Text("✓", color = accent)
+                      }
+                  }
+                  Spacer(Modifier.height(18.dp))
+                  Button(onClick = chooseWallpaper, modifier = Modifier.fillMaxWidth()) { Text("Выбрать системные обои") }
+                  Text("Живой градиент Aether работает внутри рабочего стола приложения.", color = muted, fontSize = 11.sp)
+              }
+          }
+
+          @Composable
+          private fun WidgetStudio(visible: Boolean, setVisible: (Boolean) -> Unit, scale: Float, setScale: (Float) -> Unit,
+              fg: Color, muted: Color, glass: Color, accent: Color) {
+              Column(Modifier.fillMaxSize().padding(22.dp)) {
+                  Text("Виджеты", color = fg, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+                  Text("Добавляй карточки и меняй их размер", color = muted)
+                  Spacer(Modifier.height(20.dp))
+                  ToggleRow("Виджет погоды на рабочем столе", visible, setVisible, glass, fg)
+                  Card(colors = CardDefaults.cardColors(containerColor = glass)) {
+                      Column(Modifier.fillMaxWidth().padding(16.dp)) {
+                          Text("Предпросмотр", color = muted, fontSize = 11.sp)
+                          Text("☀  24°   Ясно", color = fg, fontSize = (28 * scale).sp)
+                          Text("Aether Weather", color = muted, fontSize = 11.sp)
+                      }
+                  }
+                  Spacer(Modifier.height(16.dp))
+                  Text("Размер: ${(scale * 100).roundToInt()}%", color = fg)
+                  Slider(value = scale, onValueChange = setScale, valueRange = .75f..1.4f)
+                  Text("Положение виджета меняется перетаскиванием карточки на главном экране.", color = muted, fontSize = 12.sp)
+                  Spacer(Modifier.height(12.dp))
+                  Button(onClick = { setVisible(true) }, modifier = Modifier.fillMaxWidth()) { Text("Добавить виджет погоды") }
+              }
+          }
+
+          @Composable
+          private fun ToggleRow(title: String, checked: Boolean, onChange: (Boolean) -> Unit, glass: Color, fg: Color) {
+              Card(Modifier.padding(bottom = 10.dp), colors = CardDefaults.cardColors(containerColor = glass)) {
+                  Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+                      verticalAlignment = Alignment.CenterVertically) {
+                      Text(title, color = fg, modifier = Modifier.weight(1f), fontSize = 14.sp)
+                      Switch(checked, onChange)
+                  }
+              }
+          }
+
+          @Composable
+          private fun FeatureTile(icon: String, title: String, subtitle: String, glass: Color, fg: Color, muted: Color,
+              accent: Color, action: () -> Unit) {
+              Card(Modifier.fillMaxWidth().padding(bottom = 10.dp).clickable { action() },
+                  colors = CardDefaults.cardColors(containerColor = glass), shape = RoundedCornerShape(20.dp)) {
+                  Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                      Text(icon, color = accent, fontSize = 25.sp)
+                      Spacer(Modifier.width(14.dp))
+                      Column {
+                          Text(title, color = fg, fontWeight = FontWeight.SemiBold)
+                          Text(subtitle, color = muted, fontSize = 11.sp)
+                      }
+                      Spacer(Modifier.weight(1f))
+                      Text("›", color = muted, fontSize = 24.sp)
+                  }
+              }
+          }
+
+          @Composable
+          private fun DockItem(icon: String, title: String, fg: Color, action: () -> Unit) {
+              Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable { action() }.padding(horizontal = 8.dp)) {
+                  Text(icon, color = fg, fontSize = 23.sp)
+                  Text(title, color = fg.copy(alpha = .75f), fontSize = 9.sp)
+              }
+          }
+
+          @Composable
+          private fun GlassButton(text: String, action: () -> Unit) {
+              Box(Modifier.size(48.dp).clip(CircleShape).background(Color.White.copy(alpha = .16f))
+                  .clickable { action() }, contentAlignment = Alignment.Center) {
+                  Text(text, color = Color.White, fontSize = 22.sp)
+              }
+          }
+
+          private fun LaunchByIntent(context: android.content.Context, intent: Intent) {
+              runCatching { context.startActivity(intent) }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aether-Launcher-2-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
