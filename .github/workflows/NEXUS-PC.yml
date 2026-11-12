@@ -1,0 +1,348 @@
+name: Build NEXUS PC
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "NEXUS-PC.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Create application source
+        shell: pwsh
+        run: |
+          @'
+          import os
+          import sys
+          import shutil
+          import tempfile
+          import subprocess
+          import ctypes
+          from pathlib import Path
+
+          import psutil
+          from PySide6.QtCore import Qt, QTimer, QUrl, QDir
+          from PySide6.QtGui import QFont, QAction
+          from PySide6.QtWidgets import (
+              QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
+              QVBoxLayout, QHBoxLayout, QStackedWidget, QFileDialog, QMessageBox,
+              QGridLayout, QProgressBar, QTreeView, QFileSystemModel, QListWidget,
+              QListWidgetItem, QComboBox, QCheckBox, QLineEdit, QSplitter
+          )
+          from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+          from PySide6.QtMultimediaWidgets import QVideoWidget
+
+          APP_NAME = "NEXUS PC"
+
+          STYLE = """
+          QWidget { background: #09090f; color: #eeeeF7; font-family: Segoe UI; font-size: 10pt; }
+          QFrame#sidebar { background: rgba(22, 18, 35, 235); border: 1px solid #302044; border-radius: 18px; }
+          QFrame#panel, QFrame#card { background: rgba(28, 23, 43, 225); border: 1px solid #382750; border-radius: 16px; }
+          QLabel#title { font-size: 23pt; font-weight: 700; color: #ffffff; }
+          QLabel#muted { color: #aaa1bd; }
+          QPushButton { background: #21182f; border: 1px solid #493365; border-radius: 10px; padding: 10px 14px; text-align: left; }
+          QPushButton:hover { background: #38204f; border: 1px solid #a56bff; }
+          QPushButton:checked { background: #5a2a91; border: 1px solid #c49aff; }
+          QPushButton#primary { background: #783bd0; border: 1px solid #a878f3; font-weight: 600; }
+          QPushButton#primary:hover { background: #9251ed; }
+          QLineEdit, QComboBox, QListWidget, QTreeView { background: #12101b; border: 1px solid #443255; border-radius: 9px; padding: 7px; }
+          QProgressBar { border: 1px solid #49365f; border-radius: 6px; background: #171321; text-align: center; }
+          QProgressBar::chunk { background: #9b5de5; border-radius: 5px; }
+          QCheckBox { spacing: 8px; }
+          """
+
+          def card(title, value, hint=""):
+              box = QFrame()
+              box.setObjectName("card")
+              lay = QVBoxLayout(box)
+              t = QLabel(title); t.setObjectName("muted")
+              v = QLabel(value); v.setStyleSheet("font-size: 21pt; font-weight: 700; color: #d8baff;")
+              h = QLabel(hint); h.setObjectName("muted")
+              lay.addWidget(t); lay.addWidget(v); lay.addWidget(h)
+              return box
+
+          class Nexus(QMainWindow):
+              def __init__(self):
+                  super().__init__()
+                  self.setWindowTitle("NEXUS PC")
+                  self.resize(1220, 780)
+                  self.setMinimumSize(980, 650)
+                  root = QWidget()
+                  outer = QHBoxLayout(root)
+                  outer.setContentsMargins(14, 14, 14, 14)
+                  outer.setSpacing(14)
+                  self.setCentralWidget(root)
+
+                  side = QFrame(); side.setObjectName("sidebar"); side.setFixedWidth(225)
+                  sl = QVBoxLayout(side); sl.setContentsMargins(14, 18, 14, 14)
+                  brand = QLabel("NEXUS <span style='color:#b47aff'>PC</span>")
+                  brand.setTextFormat(Qt.RichText)
+                  brand.setStyleSheet("font-size:22pt;font-weight:800;padding:8px;")
+                  sl.addWidget(brand)
+                  sub = QLabel("PURPLE GLASS EDITION"); sub.setObjectName("muted"); sl.addWidget(sub)
+                  sl.addSpacing(18)
+                  self.stack = QStackedWidget()
+                  self.nav = []
+                  names = ["Home", "Nexus Wallpaper", "PC Tweaker", "File Manager", "Game Boost", "Taskbar X", "Music Visualizer"]
+                  for i, name in enumerate(names):
+                      b = QPushButton(["⌂  Home", "▧  Nexus Wallpaper", "⚙  PC Tweaker", "▤  File Manager", "▶  Game Boost", "▥  Taskbar X", "♫  Music Visualizer"][i])
+                      b.setCheckable(True); b.clicked.connect(lambda checked=False, ix=i: self.go(ix))
+                      sl.addWidget(b); self.nav.append(b)
+                  sl.addStretch()
+                  sl.addWidget(QLabel("Windows 10 / 11 • x64"))
+                  outer.addWidget(side)
+                  outer.addWidget(self.stack, 1)
+
+                  self.pages = [
+                      self.home_page(), self.wallpaper_page(), self.tweaker_page(),
+                      self.files_page(), self.game_page(), self.taskbar_page(), self.visualizer_page()
+                  ]
+                  for p in self.pages: self.stack.addWidget(p)
+                  self.go(0)
+
+                  self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_stats); self.timer.start(1500)
+                  self.visual_timer = QTimer(self); self.visual_timer.timeout.connect(self.animate_bars); self.visual_timer.start(90)
+                  self.player = QMediaPlayer(self)
+                  self.audio = QAudioOutput(self); self.player.setAudioOutput(self.audio)
+                  self.video = None
+                  self.refresh_stats()
+
+              def heading(self, title, description):
+                  w = QWidget(); l = QVBoxLayout(w); l.setContentsMargins(4, 4, 4, 16)
+                  t = QLabel(title); t.setObjectName("title")
+                  d = QLabel(description); d.setObjectName("muted")
+                  l.addWidget(t); l.addWidget(d)
+                  return w
+
+              def page(self, title, desc):
+                  w = QWidget(); l = QVBoxLayout(w); l.setContentsMargins(22, 18, 22, 18); l.setSpacing(14)
+                  l.addWidget(self.heading(title, desc))
+                  return w, l
+
+              def go(self, index):
+                  self.stack.setCurrentIndex(index)
+                  for i, b in enumerate(self.nav): b.setChecked(i == index)
+
+              def home_page(self):
+                  w, l = self.page("Welcome to NEXUS PC", "Your Windows desktop, tuned to your style.")
+                  row = QHBoxLayout()
+                  self.cpu_card = card("CPU usage", "--%", "Live system monitor")
+                  self.ram_card = card("Memory usage", "--%", "RAM in use")
+                  self.disk_card = card("System", "Windows", "NEXUS Purple Glass")
+                  row.addWidget(self.cpu_card); row.addWidget(self.ram_card); row.addWidget(self.disk_card)
+                  l.addLayout(row)
+                  panel = QFrame(); panel.setObjectName("panel"); pl = QVBoxLayout(panel)
+                  pl.addWidget(QLabel("Your control center"))
+                  pl.addWidget(QLabel("Wallpaper • Windows tuning • Files • Gaming • Taskbar • Audio visuals"))
+                  quick = QHBoxLayout()
+                  for label, idx in [("Wallpapers",1),("Optimize PC",2),("Boost a game",4)]:
+                      b = QPushButton(label); b.setObjectName("primary"); b.clicked.connect(lambda checked=False, x=idx:self.go(x)); quick.addWidget(b)
+                  pl.addLayout(quick); l.addWidget(panel); l.addStretch()
+                  return w
+
+              def wallpaper_page(self):
+                  w, l = self.page("Nexus Wallpaper", "Choose a desktop image or preview a video wallpaper.")
+                  row = QHBoxLayout()
+                  choose = QPushButton("Choose image wallpaper"); choose.setObjectName("primary"); choose.clicked.connect(self.choose_wallpaper)
+                  video = QPushButton("Open video wallpaper"); video.clicked.connect(self.open_video)
+                  row.addWidget(choose); row.addWidget(video); row.addStretch(); l.addLayout(row)
+                  self.wallpaper_info = QLabel("No wallpaper selected."); self.wallpaper_info.setObjectName("muted"); l.addWidget(self.wallpaper_info)
+                  self.video_widget = QVideoWidget(); self.video_widget.setMinimumHeight(300)
+                  self.video_widget.setStyleSheet("background:#050509;border:1px solid #49365f;border-radius:14px;")
+                  self.player.setVideoOutput(self.video_widget); l.addWidget(self.video_widget, 1)
+                  note = QLabel("Note: video files play in this preview. Setting a true animated desktop background requires a separate wallpaper host component.")
+                  note.setObjectName("muted"); note.setWordWrap(True); l.addWidget(note)
+                  return w
+
+              def choose_wallpaper(self):
+                  path, _ = QFileDialog.getOpenFileName(self, "Choose wallpaper", "", "Images (*.png *.jpg *.jpeg *.bmp)")
+                  if not path: return
+                  try:
+                      SPI_SETDESKWALLPAPER = 20
+                      ok = ctypes.windll.user32.SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, path, 3)
+                      if not ok: raise OSError("Windows could not apply the wallpaper.")
+                      self.wallpaper_info.setText("Desktop wallpaper applied: " + path)
+                  except Exception as e: QMessageBox.warning(self, "Wallpaper", str(e))
+
+              def open_video(self):
+                  path, _ = QFileDialog.getOpenFileName(self, "Choose video", "", "Videos (*.mp4 *.webm *.wmv *.avi *.mkv)")
+                  if path:
+                      self.player.setSource(QUrl.fromLocalFile(path)); self.player.play()
+                      self.wallpaper_info.setText("Previewing video: " + path)
+
+              def tweaker_page(self):
+                  w, l = self.page("PC Tweaker", "Useful Windows maintenance tools. Review actions before running them.")
+                  p = QFrame(); p.setObjectName("panel"); pl = QVBoxLayout(p)
+                  pl.addWidget(QLabel("Maintenance"))
+                  b1 = QPushButton("Open Windows Storage settings"); b1.clicked.connect(lambda:self.open_uri("ms-settings:storagesense"))
+                  b2 = QPushButton("Open Startup Apps settings"); b2.clicked.connect(lambda:self.open_uri("ms-settings:startupapps"))
+                  b3 = QPushButton("Open Windows Update"); b3.clicked.connect(lambda:self.open_uri("ms-settings:windowsupdate"))
+                  b4 = QPushButton("Clean current user's temporary files"); b4.setObjectName("primary"); b4.clicked.connect(self.clean_temp)
+                  for b in (b1,b2,b3,b4): pl.addWidget(b)
+                  l.addWidget(p)
+                  tip = QLabel("NEXUS does not silently disable Windows services, security features, or system processes. Use Windows settings for changes that need administrator approval.")
+                  tip.setWordWrap(True); tip.setObjectName("muted"); l.addWidget(tip); l.addStretch()
+                  return w
+
+              def open_uri(self, uri):
+                  try: os.startfile(uri)
+                  except Exception as e: QMessageBox.warning(self, "Windows settings", str(e))
+
+              def clean_temp(self):
+                  answer = QMessageBox.question(self, "Confirm cleanup", "Delete files and folders inside your user TEMP folder? Files currently in use will be skipped.")
+                  if answer != QMessageBox.Yes: return
+                  base = Path(tempfile.gettempdir()); removed = 0
+                  for item in base.iterdir():
+                      try:
+                          if item.is_dir(): shutil.rmtree(item)
+                          else: item.unlink()
+                          removed += 1
+                      except Exception: pass
+                  QMessageBox.information(self, "Cleanup complete", f"Removed {removed} temporary items. Files in use were skipped.")
+
+              def files_page(self):
+                  w, l = self.page("File Manager", "Browse your drives and folders.")
+                  bar = QHBoxLayout()
+                  self.file_path = QLineEdit(str(Path.home())); self.file_path.returnPressed.connect(self.navigate_files)
+                  go = QPushButton("Go"); go.clicked.connect(self.navigate_files)
+                  home = QPushButton("Home"); home.clicked.connect(lambda:self.file_path.setText(str(Path.home())) or self.navigate_files())
+                  bar.addWidget(self.file_path,1); bar.addWidget(go); bar.addWidget(home); l.addLayout(bar)
+                  self.fs_model = QFileSystemModel(); self.fs_model.setRootPath(QDir.rootPath())
+                  self.tree = QTreeView(); self.tree.setModel(self.fs_model); self.tree.setRootIndex(self.fs_model.index(str(Path.home())))
+                  self.tree.setColumnWidth(0, 380); l.addWidget(self.tree,1)
+                  return w
+
+              def navigate_files(self):
+                  path = self.file_path.text().strip()
+                  if os.path.isdir(path): self.tree.setRootIndex(self.fs_model.index(path))
+                  else: QMessageBox.warning(self, "File Manager", "Folder does not exist.")
+
+              def game_page(self):
+                  w, l = self.page("Game Boost", "Find running games and optionally raise their process priority.")
+                  row = QHBoxLayout()
+                  self.process_combo = QComboBox(); self.process_combo.setMinimumWidth(400)
+                  refresh = QPushButton("Refresh processes"); refresh.clicked.connect(self.refresh_processes)
+                  boost = QPushButton("Set Above Normal priority"); boost.setObjectName("primary"); boost.clicked.connect(self.boost_process)
+                  row.addWidget(self.process_combo,1); row.addWidget(refresh); row.addWidget(boost); l.addLayout(row)
+                  self.process_list = QListWidget(); l.addWidget(self.process_list,1)
+                  note = QLabel("Priority changes affect only the selected process and may require administrator permission. No game files or anti-cheat settings are modified.")
+                  note.setWordWrap(True); note.setObjectName("muted"); l.addWidget(note)
+                  self.refresh_processes()
+                  return w
+
+              def refresh_processes(self):
+                  if not hasattr(self, "process_combo"): return
+                  self.process_combo.clear(); self.process_list.clear()
+                  found = []
+                  for p in psutil.process_iter(["pid","name","memory_info"]):
+                      try:
+                          name = p.info["name"] or "unknown"
+                          if any(x in name.lower() for x in ["game","fortnite","valorant","steam","epic","minecraft","roblox","overwatch","cs2"]):
+                              found.append((name, p.info["pid"], p.info["memory_info"].rss // (1024*1024)))
+                      except Exception: pass
+                  for name,pid,mem in sorted(found):
+                      self.process_combo.addItem(f"{name}  (PID {pid})", pid)
+                      self.process_list.addItem(f"{name}  •  PID {pid}  •  {mem} MB RAM")
+                  if not found: self.process_list.addItem("No likely game processes detected. Refresh while your game is running.")
+
+              def boost_process(self):
+                  pid = self.process_combo.currentData()
+                  if not pid: return
+                  try:
+                      psutil.Process(int(pid)).nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS)
+                      QMessageBox.information(self, "Game Boost", "Priority changed to Above Normal.")
+                  except Exception as e: QMessageBox.warning(self, "Game Boost", f"Could not change priority: {e}")
+
+              def taskbar_page(self):
+                  w, l = self.page("Taskbar X", "Simple Windows taskbar appearance controls.")
+                  p = QFrame(); p.setObjectName("panel"); pl = QVBoxLayout(p)
+                  pl.addWidget(QLabel("Taskbar transparency"))
+                  self.transparency = QCheckBox("Enable transparent taskbar (Windows may override this setting)")
+                  self.transparency.stateChanged.connect(self.set_transparency)
+                  pl.addWidget(self.transparency)
+                  open_settings = QPushButton("Open Windows taskbar settings"); open_settings.setObjectName("primary")
+                  open_settings.clicked.connect(lambda:self.open_uri("ms-settings:taskbar"))
+                  pl.addWidget(open_settings)
+                  pl.addWidget(QLabel("For full blur, centered layout, and advanced effects, Windows version and third-party shell support may be required."))
+                  l.addWidget(p); l.addStretch()
+                  return w
+
+              def set_transparency(self, state):
+                  try:
+                      import winreg
+                      key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
+                      winreg.SetValueEx(key, "EnableTransparency", 0, winreg.REG_DWORD, 1 if state else 0)
+                      winreg.CloseKey(key)
+                      QMessageBox.information(self, "Taskbar X", "Windows transparency preference updated. Sign out or restart Explorer if the appearance does not change.")
+                  except Exception as e: QMessageBox.warning(self, "Taskbar X", str(e))
+
+              def visualizer_page(self):
+                  w, l = self.page("Music Visualizer", "Animated neon spectrum preview.")
+                  self.bars = []
+                  holder = QFrame(); holder.setObjectName("panel"); grid = QGridLayout(holder)
+                  for i in range(32):
+                      bar = QProgressBar(); bar.setRange(0,100); bar.setValue(10+i%5); bar.setTextVisible(False); bar.setFixedHeight(230)
+                      self.bars.append(bar); grid.addWidget(bar,0,i)
+                  l.addWidget(holder,1)
+                  self.visual_label = QLabel("Visualizer preview animation — not connected to system audio input.")
+                  self.visual_label.setObjectName("muted"); l.addWidget(self.visual_label)
+                  return w
+
+              def animate_bars(self):
+                  import random
+                  if hasattr(self, "bars"):
+                      for b in self.bars: b.setValue(random.randint(8,100))
+
+              def refresh_stats(self):
+                  try:
+                      cpu = psutil.cpu_percent()
+                      mem = psutil.virtual_memory().percent
+                      self.cpu_card.findChildren(QLabel)[1].setText(f"{cpu:.0f}%")
+                      self.ram_card.findChildren(QLabel)[1].setText(f"{mem:.0f}%")
+                  except Exception: pass
+
+          if __name__ == "__main__":
+              app = QApplication(sys.argv)
+              app.setStyleSheet(STYLE)
+              app.setFont(QFont("Segoe UI", 10))
+              window = Nexus()
+              window.show()
+              sys.exit(app.exec())
+          '@ | Set-Content -Encoding UTF8 nexus_pc.py
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySide6 psutil pyinstaller
+
+      - name: Build NEXUS PC executable
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name NEXUS-PC --collect-all PySide6 nexus_pc.py
+
+      - name: Package output
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/NEXUS-PC -DestinationPath NEXUS-PC-Windows-x64.zip -Force
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-PC-Windows-x64
+          path: |
+            dist/NEXUS-PC/NEXUS-PC.exe
+            NEXUS-PC-Windows-x64.zip
+          if-no-files-found: error
