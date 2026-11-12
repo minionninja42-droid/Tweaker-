@@ -1,0 +1,79 @@
+name: Build PC Boost
+
+# Положи файл в репозиторий: .github/workflows/pc-boost.yml
+# Запуск: вкладка Actions -> Build PC Boost -> Run workflow
+# или создай тег: git tag v1.0.0 && git push origin v1.0.0
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create boost.ps1
+        shell: pwsh
+        run: |
+          @'
+          Write-Host "=== PC Boost ===" -ForegroundColor Cyan
+
+          function Get-FreeGB { [math]::Round((Get-PSDrive C).Free / 1GB, 2) }
+          $before = Get-FreeGB
+
+          Write-Host "[1/5] Очистка временных файлов..."
+          $paths = @($env:TEMP, "$env:WINDIR\Temp", "$env:LOCALAPPDATA\Temp")
+          foreach ($p in $paths | Select-Object -Unique) {
+            if (Test-Path $p) {
+              Get-ChildItem $p -Recurse -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          Write-Host "[2/5] Очистка корзины..."
+          Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+
+          Write-Host "[3/5] Сброс DNS-кэша..."
+          ipconfig /flushdns | Out-Null
+
+          Write-Host "[4/5] Схема питания: Высокая производительность..."
+          powercfg /setactive SCHEME_MIN | Out-Null
+
+          Write-Host "[5/5] Топ-5 процессов по памяти:"
+          Get-Process | Sort-Object WS -Descending | Select-Object -First 5 `
+            Name, @{n="RAM_MB";e={[math]::Round($_.WS/1MB)}} | Format-Table -AutoSize
+
+          $after = Get-FreeGB
+          Write-Host ("Свободно на C: {0} ГБ -> {1} ГБ" -f $before, $after) -ForegroundColor Green
+          Read-Host "Готово. Нажми Enter для выхода"
+          '@ | Set-Content -Path boost.ps1 -Encoding UTF8
+
+      - name: Install ps2exe
+        shell: pwsh
+        run: Install-Module ps2exe -Force -Scope CurrentUser
+
+      - name: Build PCBoost.exe
+        shell: pwsh
+        run: |
+          Invoke-ps2exe -inputFile boost.ps1 -outputFile PCBoost.exe `
+            -requireAdmin -title "PC Boost" -version "1.0.0"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PCBoost
+          path: PCBoost.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PCBoost.exe
